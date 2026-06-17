@@ -101,7 +101,7 @@ async def send_polls(bot, chat_id: str, questions: list[dict]):
                     question           = q["question"][:MAX_Q],
                     options            = opts,
                     type               = "quiz",
-                    correct_option_id = [q["correct"]],
+                    correct_option_id = [q["correct"],
                     is_anonymous       = True,
                 )
                 success += 1
