@@ -153,10 +153,19 @@ def extract_questions(text):
     cur_num      = None
     auto_counter = 0
 
+    def clean_option_text(opt):
+        """ينظف نص الخيار من أي نقاط أو مسافات زائدة في نهايته فقط، بحيث
+        'خيار .' و'خيار.' و'خيار' تُعامل كلها كنفس الخيار 'خيار'. هذا التنظيف
+        يُطبَّق هنا في مكان واحد على كل الخيارات (سطر مستقل أو سطر واحد inline)
+        بدل تكراره في كل مسار استخراج على حدة."""
+        opt = opt.strip()
+        opt = re.sub(r'\s*\.+\s*$', '', opt)
+        return opt.strip()
+
     def parse_inline_options(line):
         matches = INLINE_OPT.findall(line)
         if len(matches) >= 2:
-            return [m[1].strip().rstrip('.') for m in matches]
+            return [m[1].strip() for m in matches]
         return []
 
     def flush():
@@ -169,7 +178,7 @@ def extract_questions(text):
         if ans is not None and 2 <= len(cur_opts) <= TG_MAX_POLL_OPTIONS and ans < len(cur_opts):
             questions.append({
                 "question": " ".join(cur_q).strip(),
-                "options" : [o.strip() for o in cur_opts],
+                "options" : [clean_option_text(o) for o in cur_opts],
                 "correct" : ans,
             })
 
@@ -263,10 +272,11 @@ async def send_polls(bot, chat_id, questions, ctx, progress_msg=None,
     - الإلغاء الفوري: يُتحقق من ctx.bot_data['cancel_flags'][control_chat_id]
       قبل كل سؤال وقبل كل محاولة إعادة إرسال، فيتوقف البوت فوراً عند /cancel
       بدل الانتظار حتى نهاية السؤال الحالي.
-    - سؤال أطول من حد تيليجرام (300 حرف): يُرسل كاملاً كرسالة نصية منفصلة،
-      ويُستبدل نص الاستطلاع بعبارة "Choose the correct answer".
-    - خيار أطول من حد تيليجرام (100 حرف): تُرسل كل الخيارات كرسالة نصية كاملة،
-      ويُكتفى داخل الاستطلاع بحروف الخيارات فقط (A, B, C ...).
+    - سؤال أطول من حد تيليجرام (300 حرف): يُرسل كاملاً كرسالة نصية مباشرة
+      (بدون أي عنوان/هيدر)، ويُستبدل نص الاستطلاع بعبارة "Choose the correct answer".
+    - خيار أطول من حد تيليجرام (100 حرف): يُرسل السؤال مع كل الخيارات كاملة
+      في رسالة نصية واحدة (بدون عنوان)، ويُكتفى داخل الاستطلاع نفسه بحروف
+      الخيارات فقط (A, B, C ...).
     - RetryAfter يُعالَج تلقائياً بالانتظار ثم إعادة المحاولة لنفس السؤال.
     - last_sent يُحفظ في ctx.user_data بعد كل سؤال ناجح لدعم /resume.
     """
@@ -287,23 +297,29 @@ async def send_polls(bot, chat_id, questions, ctx, progress_msg=None,
         question_text = q["question"]
         options       = q["options"]
 
-        # --- السؤال أطول من الحد: أرسله كاملاً كرسالة نصية منفصلة ---
-        poll_question = question_text
-        if len(question_text) > MAX_Q:
-            full_text = f"📋 السؤال {qn} (نص كامل):\n\n{question_text}"
-            for chunk in split_message(full_text):
-                await bot.send_message(chat_id=chat_id, text=chunk)
-            poll_question = "Choose the correct answer"
+        # --- معالجة تجاوز الحدود: نص السؤال أطول من 300، أو أي خيار أطول من 100 ---
+        question_overflow = len(question_text) > MAX_Q
+        options_overflow  = any(len(o) > MAX_OPT for o in options)
 
-        # --- أي خيار أطول من الحد: أرسل كل الخيارات كرسالة نصية منفصلة ---
-        poll_options = list(options)
-        if any(len(o) > MAX_OPT for o in options):
-            letters = [chr(ord('A') + idx) for idx in range(len(options))]
-            full_opts = "\n".join(f"{l}. {o}" for l, o in zip(letters, options))
-            full_text = f"📋 خيارات السؤال {qn} (نص كامل):\n\n{full_opts}"
+        poll_question = question_text
+        poll_options  = list(options)
+
+        if question_overflow or options_overflow:
+            # رسالة نصية واحدة فقط، بدون أي عنوان/هيدر: السؤال كاملاً، ومعه
+            # الخيارات كاملة أيضاً إن كانت هي السبب في تجاوز الحد
+            full_text = question_text
+            if options_overflow:
+                letters = [chr(ord('A') + idx) for idx in range(len(options))]
+                opts_block = "\n".join(f"{l}. {o}" for l, o in zip(letters, options))
+                full_text = f"{question_text}\n\n{opts_block}"
+                poll_options = letters
+
             for chunk in split_message(full_text):
                 await bot.send_message(chat_id=chat_id, text=chunk)
-            poll_options = letters
+
+            # الاستطلاع نفسه: يعرض نص السؤال الحقيقي إن كان يتسع ضمن الحد،
+            # وإلا يُستبدل بعبارة مختصرة لأن النص الكامل أُرسل أعلاه بالفعل
+            poll_question = question_text if not question_overflow else "Choose the correct answer"
 
         opts = [o[:MAX_OPT] for o in poll_options]
         if len(opts) < TG_MAX_POLL_OPTIONS:
