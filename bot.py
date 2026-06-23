@@ -95,13 +95,80 @@ def extract_text_from_file(filename, data: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
+# تحليل قيمة الإجابة — يدعم كل الصيغ الممكنة
+# ---------------------------------------------------------------------------
+def _parse_answer_value(raw: str):
+    """
+    يحوّل نص الإجابة الخام إلى قيمة داخلية:
+      - حرف واحد  (A-J)              → int        (0-9)
+      - متعددة    B&D / A,C / A or B → "MULTI:BD"
+      - ALL / all of the above / كل ما سبق → "ALL"
+      - NONE / none of the above      → "NONE"
+      - غير معروف                     → None  (يُتجاهل السؤال)
+    """
+    s = raw.strip().upper()
+
+    # --- ALL variants ---
+    ALL_PAT = re.compile(
+        r'^(ALL(\s+OF\s+(THE\s+)?ABOVE)?'
+        r'|كل\s*(ما\s*)?سبق'
+        r'|جميع\s*(ما\s*)?سبق'
+        r'|كلها|جميعها)$', re.I | re.U)
+    if ALL_PAT.match(s):
+        return "ALL"
+
+    # --- NONE variants ---
+    NONE_PAT = re.compile(
+        r'^(NONE(\s+OF\s+(THE\s+)?ABOVE)?'
+        r'|لا\s*شيء(\s*مما\s*سبق)?)$', re.I | re.U)
+    if NONE_PAT.match(s):
+        return "NONE"
+
+    # استخرج الحروف المنفردة فقط (word boundary — يتجنب حروف كلمة AND/OR)
+    letters = re.findall(r'\b([A-J])\b', s)
+    if not letters:
+        return None
+
+    if len(letters) == 1:
+        return ord(letters[0]) - ord('A')
+
+    # أكثر من حرف → MULTI (يحافظ على الترتيب ويزيل التكرار)
+    unique = list(dict.fromkeys(letters))
+    return f"MULTI:{''.join(unique)}"
+
+
+def _build_multi_option(opts: list, letters: str, clean_fn) -> tuple:
+    """
+    يبني خيار "كل ما سبق من A و B و..." ويعيد (new_opts_list, correct_idx).
+    يضيف الخيار المدمج كآخر عنصر في القائمة.
+    """
+    label = " & ".join(letters)          # e.g.  "B & D"
+    combo = f"({label}) كلاهما صحيح"
+    new_opts = [clean_fn(o) for o in opts] + [combo]
+    return new_opts, len(new_opts) - 1
+
+
+# ---------------------------------------------------------------------------
 # استخراج الأسئلة من النص
 # ---------------------------------------------------------------------------
 def extract_questions(text):
     Q_PAT          = re.compile(r'^(?:Q(?:uestion)?\s*)?(\d+)\s*[.\):\-:]\s*', re.I)
     OPT_PAT        = re.compile(r'^([A-Ja-j])\s*[.\)\-]\s*', re.I)
-    ANS_PAT        = re.compile(
-        r'^(?:Correct\s*Answer|Answer|Ans|Correct)\s*[:=\-]\s*([A-Ja-j])\b', re.I)
+
+    # ANS_PAT: ALL/NONE أولاً (قبل أي حرف منفرد لتجنب التقاط A من ALL)
+    ANS_PAT = re.compile(
+        r'^(?:Correct\s*Answer|Answer|Ans|Correct|الإجابة|الجواب)\s*[:=\-]\s*'
+        r'('
+        r'ALL(?:\s+OF\s+(?:THE\s+)?ABOVE)?'
+        r'|كل\s*(?:ما\s*)?سبق|جميع\s*(?:ما\s*)?سبق|كلها|جميعها'
+        r'|NONE(?:\s+OF\s+(?:THE\s+)?ABOVE)?'
+        r'|لا\s*شيء(?:\s*مما\s*سبق)?'
+        r'|[A-Ja-j](?:\s+(?:and|or)\s+[A-Ja-j])+'
+        r'|[A-Ja-j](?:\s*[&,+/]\s*[A-Ja-j])+'
+        r'|[A-Ja-j]'
+        r')',
+        re.I | re.U
+    )
     ANS_ONLY_PAT   = re.compile(r'^([A-Ja-j])\s*$')
     ANSWER_KEY_LINE= re.compile(r'^(\d+)\s*[-.\):]\s*([A-Ja-j])\s*$', re.I)
     ANSWER_KEY_HDR = re.compile(r'^(answers?\s*key|key|answers?)\s*:?\s*$', re.I)
@@ -109,6 +176,7 @@ def extract_questions(text):
 
     lines = text.splitlines()
 
+    # --- كشف answer key مستقل ---
     answer_key, key_line_idx = {}, set()
     for i, raw in enumerate(lines):
         m = ANSWER_KEY_LINE.match(raw.strip())
@@ -134,13 +202,64 @@ def extract_questions(text):
         return []
 
     def flush():
+        nonlocal cur_ans
+        if not cur_q:
+            return
+
         ans = cur_ans
+        # fallback من answer key
         if ans is None and cur_num is not None and cur_num in answer_key:
             ans = ord(answer_key[cur_num]) - ord('A')
-        if ans is not None and 2 <= len(cur_opts) <= TG_MAX_POLL_OPTIONS and ans < len(cur_opts):
+
+        if ans is None or not cur_opts:
+            return
+
+        cleaned_opts = [clean_option_text(o) for o in cur_opts]
+
+        # --- ALL ---
+        if ans == "ALL":
+            new_opts = cleaned_opts + ["All of the above ✔"]
+            correct  = len(new_opts) - 1
+            if 2 <= len(new_opts) <= TG_MAX_POLL_OPTIONS:
+                questions.append({
+                    "question": " ".join(cur_q).strip(),
+                    "options":  new_opts,
+                    "correct":  correct,
+                    "image":    None,
+                })
+            return
+
+        # --- NONE ---
+        if ans == "NONE":
+            new_opts = cleaned_opts + ["None of the above ✔"]
+            correct  = len(new_opts) - 1
+            if 2 <= len(new_opts) <= TG_MAX_POLL_OPTIONS:
+                questions.append({
+                    "question": " ".join(cur_q).strip(),
+                    "options":  new_opts,
+                    "correct":  correct,
+                    "image":    None,
+                })
+            return
+
+        # --- MULTI (B&D, A,C, ...) ---
+        if isinstance(ans, str) and ans.startswith("MULTI:"):
+            letters = ans[6:]   # e.g. "BD"
+            new_opts, correct = _build_multi_option(cur_opts, list(letters), clean_option_text)
+            if 2 <= len(new_opts) <= TG_MAX_POLL_OPTIONS:
+                questions.append({
+                    "question": " ".join(cur_q).strip(),
+                    "options":  new_opts,
+                    "correct":  correct,
+                    "image":    None,
+                })
+            return
+
+        # --- إجابة عادية (int) ---
+        if isinstance(ans, int) and 2 <= len(cleaned_opts) <= TG_MAX_POLL_OPTIONS and ans < len(cleaned_opts):
             questions.append({
                 "question": " ".join(cur_q).strip(),
-                "options":  [clean_option_text(o) for o in cur_opts],
+                "options":  cleaned_opts,
                 "correct":  ans,
                 "image":    None,
             })
@@ -153,13 +272,16 @@ def extract_questions(text):
         if i in key_line_idx:
             continue
         line = raw.strip()
+
         if not line:
             if cur_ans is not None and cur_opts:
                 flush(); reset()
             continue
+
         if ANSWER_KEY_HDR.match(line):
             if cur_q: flush(); reset()
             continue
+
         qm = Q_PAT.match(line)
         if qm and not ANS_PAT.match(line):
             flush(); auto_counter += 1
@@ -167,10 +289,12 @@ def extract_questions(text):
             cur_q   = [Q_PAT.sub("", line, count=1).strip()]
             cur_opts, cur_ans, cur_opt_idx = [], None, None
             continue
-        if ANS_PAT.match(line):
-            m = ANS_PAT.match(line)
-            cur_ans = ord(m.group(1).upper()) - ord('A')
+
+        m_ans = ANS_PAT.match(line)
+        if m_ans:
+            cur_ans = _parse_answer_value(m_ans.group(1))
             continue
+
         if OPT_PAT.match(line):
             inline = parse_inline_options(line)
             if inline:
@@ -179,9 +303,11 @@ def extract_questions(text):
                 cur_opts.append(OPT_PAT.sub("", line, count=1).strip())
             cur_opt_idx = len(cur_opts) - 1
             continue
+
         if cur_opt_idx is not None and cur_ans is None and ANS_ONLY_PAT.match(line):
             cur_ans = ord(line.upper()) - ord('A')
             continue
+
         if cur_opt_idx is not None and cur_ans is None:
             inline = parse_inline_options(line)
             if inline:
@@ -189,9 +315,11 @@ def extract_questions(text):
             else:
                 cur_opts[cur_opt_idx] += " " + line
             continue
+
         if cur_q and cur_ans is None and cur_opt_idx is None:
             cur_q.append(line)
             continue
+
         flush(); auto_counter += 1
         cur_num = auto_counter
         cur_q   = [line]
@@ -202,16 +330,28 @@ def extract_questions(text):
 
 
 # ---------------------------------------------------------------------------
-# استخراج خيارات الإجابة للأسئلة المصوّرة
+# استخراج خيارات الإجابة للأسئلة المصوّرة — يدعم نفس صيغ الإجابات
 # ---------------------------------------------------------------------------
 def extract_options_and_answer(text: str):
-    OPT_PAT      = re.compile(r'^([A-Ja-j])\s*[.\)\-]\s*(.+)', re.I)
-    ANS_PAT      = re.compile(r'^(?:Correct\s*Answer|Answer|Ans|Correct)\s*[:=\-]\s*([A-Ja-j])\b', re.I)
+    OPT_PAT = re.compile(r'^([A-Ja-j])\s*[.\)\-]\s*(.+)', re.I)
+    ANS_PAT = re.compile(
+        r'^(?:Correct\s*Answer|Answer|Ans|Correct|الإجابة|الجواب)\s*[:=\-]\s*'
+        r'('
+        r'ALL(?:\s+OF\s+(?:THE\s+)?ABOVE)?'
+        r'|كل\s*(?:ما\s*)?سبق|جميع\s*(?:ما\s*)?سبق|كلها|جميعها'
+        r'|NONE(?:\s+OF\s+(?:THE\s+)?ABOVE)?'
+        r'|لا\s*شيء(?:\s*مما\s*سبق)?'
+        r'|[A-Ja-j](?:\s+(?:and|or)\s+[A-Ja-j])+'
+        r'|[A-Ja-j](?:\s*[&,+/]\s*[A-Ja-j])+'
+        r'|[A-Ja-j]'
+        r')',
+        re.I | re.U
+    )
     ANS_ONLY_PAT = re.compile(r'^([A-Ja-j])\s*$')
     INLINE_OPT   = re.compile(r'([A-Ja-j])\s*[.\)]\s*(.*?)(?=\s+[A-Ja-j]\s*[.\)]|$)', re.I)
 
     lines = text.strip().splitlines()
-    opts, answer, opt_idx = [], None, None
+    opts, raw_answer, opt_idx = [], None, None
 
     def clean(s):
         s = s.strip()
@@ -224,7 +364,7 @@ def extract_options_and_answer(text: str):
             continue
         m_ans = ANS_PAT.match(line)
         if m_ans:
-            answer = ord(m_ans.group(1).upper()) - ord('A')
+            raw_answer = m_ans.group(1)
             continue
         m_opt = OPT_PAT.match(line)
         if m_opt:
@@ -234,15 +374,34 @@ def extract_options_and_answer(text: str):
             else:
                 opts.append(clean(m_opt.group(2))); opt_idx = len(opts) - 1
             continue
-        if opt_idx is not None and answer is None and ANS_ONLY_PAT.match(line):
-            answer = ord(line.upper()) - ord('A')
+        if opt_idx is not None and raw_answer is None and ANS_ONLY_PAT.match(line):
+            raw_answer = line
             continue
-        if opt_idx is not None and answer is None:
+        if opt_idx is not None and raw_answer is None:
             opts[opt_idx] += " " + line.strip()
             continue
 
-    if len(opts) >= 2 and answer is not None and answer < len(opts):
-        return opts, answer
+    if len(opts) < 2 or raw_answer is None:
+        return None, None
+
+    ans = _parse_answer_value(raw_answer)
+
+    if ans == "ALL":
+        new_opts = opts + ["All of the above ✔"]
+        return new_opts, len(new_opts) - 1
+
+    if ans == "NONE":
+        new_opts = opts + ["None of the above ✔"]
+        return new_opts, len(new_opts) - 1
+
+    if isinstance(ans, str) and ans.startswith("MULTI:"):
+        letters = ans[6:]
+        new_opts, correct = _build_multi_option(opts, list(letters), clean)
+        return new_opts, correct
+
+    if isinstance(ans, int) and ans < len(opts):
+        return opts, ans
+
     return None, None
 
 
