@@ -1138,6 +1138,7 @@ async def cmd_delay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """ضبط التأخير بين الأسئلة: /delay 1.5"""
     if not is_admin(update.effective_user.id):
         return
+    global SEND_DELAY
     args = ctx.args
     if not args:
         current = ctx.user_data.get("send_delay", SEND_DELAY)
@@ -1152,8 +1153,6 @@ async def cmd_delay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not 0.3 <= val <= 10:
             raise ValueError
         ctx.user_data["send_delay"] = val
-        # تحديث SEND_DELAY للجلسة
-        global SEND_DELAY
         SEND_DELAY = val
         await update.message.reply_text(f"✅ تم ضبط التأخير على *{val}s*", parse_mode="Markdown")
     except ValueError:
