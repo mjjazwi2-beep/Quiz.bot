@@ -2,6 +2,7 @@ import io
 import base64
 import logging
 import os
+
 import httpx
 
 logger = logging.getLogger("AIExtractor")
@@ -39,6 +40,7 @@ async def extract_text_from_pdf(data: bytes) -> str:
             pages = [p.extract_text() or "" for p in pdf.pages]
             text = "\n".join(pages)
             if len(text.strip()) > 50:
+                logger.info("pdfplumber نجح — %d حرف", len(text))
                 return text
     except Exception as e:
         logger.warning("pdfplumber فشل: %s", e)
@@ -49,6 +51,7 @@ async def extract_text_from_pdf(data: bytes) -> str:
         pages = [page.extract_text() or "" for page in reader.pages]
         text = "\n".join(pages)
         if len(text.strip()) > 50:
+            logger.info("PyPDF2 نجح — %d حرف", len(text))
             return text
     except Exception as e:
         logger.warning("PyPDF2 فشل: %s", e)
@@ -57,6 +60,9 @@ async def extract_text_from_pdf(data: bytes) -> str:
 
 
 async def ask_claude(messages: list, use_pdf_beta: bool = False) -> str:
+    if not ANTHROPIC_KEY:
+        raise ValueError("ANTHROPIC_API_KEY غير موجود في المتغيرات البيئية!")
+
     headers = {
         "x-api-key": ANTHROPIC_KEY,
         "anthropic-version": "2023-06-01",
@@ -73,23 +79,32 @@ async def ask_claude(messages: list, use_pdf_beta: bool = False) -> str:
 
     logger.info("إرسال طلب لـ Claude — use_pdf_beta=%s", use_pdf_beta)
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=payload,
-        )
-        logger.info("استجابة Claude: %d", resp.status_code)
-        if resp.status_code != 200:
-            logger.error("خطأ Claude كامل: %s", resp.text)
-            resp.raise_for_status()
-        return resp.json()["content"][0]["text"]
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload,
+            )
+            logger.info("استجابة Claude: %d", resp.status_code)
+            if resp.status_code != 200:
+                logger.error("خطأ Claude: %s", resp.text)
+                resp.raise_for_status()
+            result = resp.json()["content"][0]["text"]
+            logger.info("Claude أعاد %d حرف", len(result))
+            return result
+    except httpx.TimeoutException:
+        logger.error("انتهت مهلة الاتصال بـ Claude")
+        raise RuntimeError("انتهت مهلة Claude (180 ثانية) — حاول مجدداً")
+    except httpx.HTTPStatusError as e:
+        logger.error("HTTP Error من Claude: %s", e)
+        raise RuntimeError(f"خطأ من Claude API: {e.response.status_code}")
 
 
 async def ask_claude_with_text(text: str) -> str:
     if len(text) > 80000:
         text = text[:80000]
-        logger.warning("النص كبير — تم اقتطاعه")
+        logger.warning("النص كبير — تم اقتطاعه إلى 80000 حرف")
 
     messages = [{
         "role": "user",
@@ -147,32 +162,39 @@ async def ask_claude_with_pdf_bytes(data: bytes) -> str:
 async def smart_extract_mcq(filename: str, data: bytes) -> str:
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "txt"
 
-    logger.info("معالجة ملف: %s (نوع: %s، حجم: %d bytes)", filename, ext, len(data))
+    logger.info("▶ smart_extract_mcq — ملف: %s | نوع: %s | حجم: %d bytes",
+                filename, ext, len(data))
+
+    if not ANTHROPIC_KEY:
+        raise ValueError("ANTHROPIC_API_KEY غير مضبوط!")
 
     image_types = {
-        "jpg": "image/jpeg",
+        "jpg":  "image/jpeg",
         "jpeg": "image/jpeg",
-        "png": "image/png",
+        "png":  "image/png",
         "webp": "image/webp",
     }
 
+    # صورة
     if ext in image_types:
         img_b64 = base64.standard_b64encode(data).decode("utf-8")
         logger.info("صورة — إرسال لـ Claude Vision")
         return await ask_claude_with_image(img_b64, image_types[ext])
 
+    # PDF
     if ext == "pdf":
         text = await extract_text_from_pdf(data)
         if text:
-            logger.info("PDF نصي — إرسال النص لـ Claude")
+            logger.info("PDF نصي — إرسال النص لـ Claude (%d حرف)", len(text))
             return await ask_claude_with_text(text)
         logger.info("PDF ممسوح — إرسال مباشر لـ Claude")
         return await ask_claude_with_pdf_bytes(data)
 
+    # نص عادي
     for enc in ("utf-8", "utf-8-sig", "cp1256", "latin-1"):
         try:
             text = data.decode(enc)
-            logger.info("ملف نصي — إرسال لـ Claude")
+            logger.info("ملف نصي (%s) — إرسال لـ Claude", enc)
             return await ask_claude_with_text(text)
         except UnicodeDecodeError:
             continue
