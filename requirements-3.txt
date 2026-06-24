@@ -1,0 +1,6 @@
+python-telegram-bot[rate-limiter]==21.3
+httpx
+pdfplumber
+PyPDF2
+python-docx
+PyMuPDF
