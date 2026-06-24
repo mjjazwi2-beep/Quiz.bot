@@ -3,6 +3,7 @@ import base64
 import logging
 import os
 import asyncio
+import re
 
 import httpx
 
@@ -20,43 +21,38 @@ MCQ_PROMPT = """You are a world-class MCQ extraction expert specialized in medic
 
 Your ONLY job: extract EVERY SINGLE question with its options and identify the correct answer with 100% accuracy.
 
-CRITICAL: This document may contain 60 or more questions. You MUST extract ALL of them without missing any.
+CRITICAL: Extract ALL questions visible on this page. Missing even one question is a failure.
 
 === HOW TO DETECT THE CORRECT ANSWER ===
-Look for ANY of these signals:
-- Circle drawn around a letter or option (most common in handwritten exams)
-- Highlighted or colored option
-- Checkmark ✓ or tick mark next to an option
-- Bold or underlined option
-- Filled bubble ● in bubble sheets (vs empty ○)
-- Strikethrough ✗ on WRONG options (correct = the one NOT crossed)
-- Any mark, dot, star, or symbol near an option
-- Answer: X / Ans: X / Correct: X written anywhere
+- Circle drawn around a letter or option
+- Highlighted or colored option (any color)
+- Checkmark ✓ or tick mark
+- Filled bubble ● (vs empty ○)
+- Strikethrough ✗ on WRONG options (correct = NOT crossed)
+- Any mark, dot, star near an option
+- Answer: X / Ans: X / Correct: X
 
-IF NO SIGNAL EXISTS:
-- Use your medical knowledge to determine the correct answer
+IF NO SIGNAL EXISTS: use your medical knowledge.
 
 === EXTRACTION RULES ===
-- Extract ALL questions from the ENTIRE document — do not stop early
-- Copy question text EXACTLY as written
+- Copy question text EXACTLY as written — zero modifications
 - Copy every option EXACTLY as written
-- Preserve original option order
-- Handle 2-column layouts (read left option then right option)
-- If options are arranged in 2 columns: a and c are on left, b and d on right — read them correctly
+- Handle 2-column layouts: read a+c on left, b+d on right
+- Include full clinical vignette text if present
 
-=== OUTPUT FORMAT — STRICTLY FOLLOW THIS ===
+=== OUTPUT FORMAT ===
 Q1. [full question text]
-A. [option a text]
-B. [option b text]
-C. [option c text]
-D. [option d text]
-Answer: [correct letter]
+A. [option a]
+B. [option b]
+C. [option c]
+D. [option d]
+Answer: [letter]
 
-=== ABSOLUTE RULES ===
+=== RULES ===
 - Output NOTHING before Q1
-- Output NOTHING after the last answer
-- No comments, no notes, no explanations
-- Extract ALL questions — missing questions is a critical failure"""
+- Output NOTHING after last answer
+- No comments, no notes, no markdown
+- If no questions found: output NO_QUESTIONS_FOUND"""
 
 
 async def ask_gemini(contents: list) -> str:
@@ -66,7 +62,7 @@ async def ask_gemini(contents: list) -> str:
     payload = {
         "contents": contents,
         "generationConfig": {
-            "maxOutputTokens": 16000,
+            "maxOutputTokens": 8000,
             "temperature": 0.05,
         }
     }
@@ -88,8 +84,6 @@ async def ask_gemini(contents: list) -> str:
                         f"{url}?key={GEMINI_KEY}",
                         json=payload,
                     )
-                    logger.info("Gemini response: %d (model=%s)", resp.status_code, model)
-
                     if resp.status_code == 200:
                         data = resp.json()
                         result = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -97,21 +91,16 @@ async def ask_gemini(contents: list) -> str:
                         return result
 
                     if resp.status_code in (503, 429):
-                        logger.warning("Status %d — retrying (model=%s)", resp.status_code, model)
                         last_error = f"{resp.status_code} (model={model})"
                         continue
 
-                    logger.error("Fatal error %d: %s", resp.status_code, resp.text[:200])
                     last_error = f"{resp.status_code}: {resp.text[:150]}"
                     break
 
             except httpx.TimeoutException:
-                logger.warning("Timeout on model=%s attempt=%d", model, attempt + 1)
                 last_error = f"Timeout (model={model})"
                 continue
-
             except Exception as e:
-                logger.error("Unexpected error: %s", e)
                 last_error = str(e)
                 break
 
@@ -120,88 +109,20 @@ async def ask_gemini(contents: list) -> str:
     raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 
-async def pdf_to_images_b64(data: bytes) -> list[tuple[str, str]]:
-    """يحول PDF إلى صور base64 — كل صفحة صورة منفصلة."""
-    try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(stream=data, filetype="pdf")
-        images = []
-        for page in doc:
-            mat = fitz.Matrix(2.0, 2.0)  # دقة x2
-            pix = page.get_pixmap(matrix=mat)
-            img_bytes = pix.tobytes("jpeg")
-            img_b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
-            images.append((img_b64, "image/jpeg"))
-        doc.close()
-        logger.info("Converted PDF to %d images via PyMuPDF", len(images))
-        return images
-    except ImportError:
-        logger.warning("PyMuPDF not available")
-    except Exception as e:
-        logger.warning("PyMuPDF failed: %s", e)
-
-    try:
-        from pdf2image import convert_from_bytes
-        pil_images = convert_from_bytes(data, dpi=200)
-        images = []
-        for pil_img in pil_images:
-            buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=85)
-            img_b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
-            images.append((img_b64, "image/jpeg"))
-        logger.info("Converted PDF to %d images via pdf2image", len(images))
-        return images
-    except ImportError:
-        logger.warning("pdf2image not available")
-    except Exception as e:
-        logger.warning("pdf2image failed: %s", e)
-
-    return []
-
-
-async def ask_gemini_all_pages(images: list[tuple[str, str]]) -> str:
-    """يرسل كل صفحات PDF دفعة واحدة لـ Gemini ليرى الكل معاً."""
-    parts = []
-    for img_b64, media_type in images:
-        parts.append({
-            "inline_data": {
-                "mime_type": media_type,
-                "data": img_b64,
-            }
-        })
-    parts.append({"text": MCQ_PROMPT})
-
-    contents = [{"role": "user", "parts": parts}]
+async def ask_gemini_single_image(img_b64: str, media_type: str, page_num: int, total: int) -> str:
+    contents = [{
+        "role": "user",
+        "parts": [
+            {"inline_data": {"mime_type": media_type, "data": img_b64}},
+            {"text": MCQ_PROMPT + f"\n\nThis is page {page_num} of {total}. Extract ALL questions on this page."}
+        ]
+    }]
     return await ask_gemini(contents)
-
-
-async def ask_gemini_page_by_page(images: list[tuple[str, str]]) -> str:
-    """يعالج كل صفحة منفردة ثم يجمع النتائج."""
-    all_results = []
-    for i, (img_b64, media_type) in enumerate(images):
-        logger.info("Processing page %d/%d", i + 1, len(images))
-        contents = [{
-            "role": "user",
-            "parts": [
-                {"inline_data": {"mime_type": media_type, "data": img_b64}},
-                {"text": MCQ_PROMPT + f"\n\nNote: This is page {i+1} of {len(images)}. Extract all questions visible on this page only."}
-            ]
-        }]
-        try:
-            result = await ask_gemini(contents)
-            if result.strip() and result.strip() != "NO_QUESTIONS_FOUND":
-                all_results.append(result.strip())
-        except Exception as e:
-            logger.error("Failed page %d: %s", i + 1, e)
-
-    return "\n\n".join(all_results) if all_results else "NO_QUESTIONS_FOUND"
 
 
 async def ask_gemini_with_text(text: str) -> str:
     if len(text) > 80000:
         text = text[:80000]
-        logger.warning("Text truncated to 80000 chars")
-
     contents = [{
         "role": "user",
         "parts": [{"text": MCQ_PROMPT + "\n\n---\n\n" + text}]
@@ -220,18 +141,92 @@ async def ask_gemini_with_image(img_b64: str, media_type: str) -> str:
     return await ask_gemini(contents)
 
 
-async def ask_gemini_with_pdf_direct(data: bytes) -> str:
-    if len(data) > 20 * 1024 * 1024:
-        raise ValueError("PDF too large (max 20MB)")
-    pdf_b64 = base64.standard_b64encode(data).decode("utf-8")
-    contents = [{
-        "role": "user",
-        "parts": [
-            {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
-            {"text": MCQ_PROMPT}
-        ]
-    }]
-    return await ask_gemini(contents)
+def pdf_to_images(data: bytes, scale: float = 3.5) -> list[tuple[str, str]]:
+    """يحول PDF إلى صور عالية الدقة."""
+    try:
+        import fitz
+        doc = fitz.open(stream=data, filetype="pdf")
+        images = []
+        mat = fitz.Matrix(scale, scale)
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat)
+            # إذا كانت الصورة كبيرة جداً نضغطها
+            img_bytes = pix.tobytes("jpeg", jpg_quality=88)
+            img_b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
+            images.append((img_b64, "image/jpeg"))
+        doc.close()
+        logger.info("Converted PDF to %d images at scale=%.1f", len(images), scale)
+        return images
+    except Exception as e:
+        logger.error("PDF to images failed: %s", e)
+        return []
+
+
+def renumber_and_deduplicate(text: str) -> str:
+    """يعيد ترقيم الأسئلة ويحذف المكررات."""
+    # استخراج كل الأسئلة
+    pattern = re.compile(
+        r'Q\d+\.\s*(.*?)\n((?:[A-D]\..+\n?)+)Answer:\s*([A-D])',
+        re.DOTALL
+    )
+    matches = pattern.findall(text)
+
+    if not matches:
+        return text
+
+    seen = set()
+    unique = []
+    for question, options, answer in matches:
+        # مفتاح التكرار: أول 60 حرف من السؤال
+        key = question.strip()[:60].lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append((question.strip(), options.strip(), answer.strip()))
+
+    # إعادة البناء مع ترقيم جديد
+    lines = []
+    for i, (q, opts, ans) in enumerate(unique, 1):
+        lines.append(f"Q{i}. {q}")
+        lines.append(opts)
+        lines.append(f"Answer: {ans}")
+        lines.append("")
+
+    logger.info("Deduplicated: %d → %d questions", len(matches), len(unique))
+    return "\n".join(lines)
+
+
+async def process_pages_parallel(images: list[tuple[str, str]]) -> str:
+    """معالجة متوازية — كل الصفحات في نفس الوقت."""
+    total = len(images)
+    logger.info("Processing %d pages in parallel", total)
+
+    # إنشاء المهام كلها دفعة واحدة
+    tasks = [
+        ask_gemini_single_image(img_b64, media_type, i + 1, total)
+        for i, (img_b64, media_type) in enumerate(images)
+    ]
+
+    # تشغيل متوازي مع semaphore لتجنب تجاوز حدود API
+    semaphore = asyncio.Semaphore(3)  # 3 طلبات في نفس الوقت كحد أقصى
+
+    async def bounded_task(task):
+        async with semaphore:
+            return await task
+
+    results = await asyncio.gather(
+        *[bounded_task(task) for task in tasks],
+        return_exceptions=True
+    )
+
+    # جمع النتائج الناجحة
+    combined = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error("Page %d failed: %s", i + 1, result)
+        elif result and result.strip() != "NO_QUESTIONS_FOUND":
+            combined.append(result.strip())
+
+    return "\n\n".join(combined) if combined else "NO_QUESTIONS_FOUND"
 
 
 async def smart_extract_mcq(filename: str, data: bytes) -> str:
@@ -254,40 +249,39 @@ async def smart_extract_mcq(filename: str, data: bytes) -> str:
     # صورة واحدة
     if ext in image_types:
         img_b64 = base64.standard_b64encode(data).decode("utf-8")
-        logger.info("Image — sending to Gemini Vision")
+        logger.info("Single image — sending to Gemini Vision")
         return await ask_gemini_with_image(img_b64, image_types[ext])
 
     # PDF
     if ext == "pdf":
-        # الاستراتيجية: حول لصور أولاً لأن الامتحانات الملتقطة بالكاميرا لا يُستخرج منها نص صحيح
-        logger.info("PDF — converting to images for full visual extraction")
-        images = await pdf_to_images_b64(data)
+        # تحويل لصور بدقة 3.5x
+        images = pdf_to_images(data, scale=3.5)
 
         if images:
-            logger.info("Got %d page images — sending all to Gemini at once", len(images))
-            try:
-                # أرسل كل الصفحات دفعة واحدة
-                result = await ask_gemini_all_pages(images)
-                logger.info("All-pages extraction returned %d chars", len(result))
-                return result
-            except Exception as e:
-                logger.warning("All-pages failed (%s) — trying page by page", e)
-                # احتياطي: صفحة صفحة
-                return await ask_gemini_page_by_page(images)
+            logger.info("Processing %d pages in parallel", len(images))
+            raw_result = await process_pages_parallel(images)
 
-        # إذا فشل تحويل الصور، جرب إرسال PDF مباشرة
-        logger.info("Image conversion failed — sending PDF directly to Gemini")
-        try:
-            return await ask_gemini_with_pdf_direct(data)
-        except Exception as e:
-            logger.error("Direct PDF failed: %s", e)
-            raise
+            # إزالة التكرار وإعادة الترقيم
+            final = renumber_and_deduplicate(raw_result)
+            logger.info("Final result: %d chars", len(final))
+            return final
+
+        # احتياطي: إرسال PDF مباشرة
+        logger.info("Fallback: sending PDF directly")
+        pdf_b64 = base64.standard_b64encode(data).decode("utf-8")
+        contents = [{
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                {"text": MCQ_PROMPT}
+            ]
+        }]
+        return await ask_gemini(contents)
 
     # نص عادي
     for enc in ("utf-8", "utf-8-sig", "cp1256", "latin-1"):
         try:
             text = data.decode(enc)
-            logger.info("Text file (%s) — sending to Gemini", enc)
             return await ask_gemini_with_text(text)
         except UnicodeDecodeError:
             continue
