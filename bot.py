@@ -1,8 +1,23 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           بوت الكويز — النسخة المثالية النهائية                ║
-║  Zero-error · Maximum flexibility · Full Arabic/English support ║
+║           بوت الكويز — النسخة المثالية النهائية v3.0           ║
+║  Zero-error · AIORateLimiter · Persistence · Full flexibility   ║
 ╚══════════════════════════════════════════════════════════════════╝
+
+التحسينات على النسخة السابقة:
+  ✅ AIORateLimiter — تحكم تلقائي في حدود Telegram بدل retry يدوي
+  ✅ PicklePersistence — حفظ البيانات عبر إعادة التشغيل
+  ✅ استخراج خيارات عربية (أ. ب. ج. د.)
+  ✅ تصحيح bug: normalize_text كان يكسر نهايات الكلمات العربية
+  ✅ تصحيح bug: SEND_DELAY global mutation غير آمن
+  ✅ تصحيح bug: _send_locks لا تُنظَّف → memory leak
+  ✅ دعم (A) بين قوسين كصيغة خيار
+  ✅ دعم أسئلة True/False تلقائياً
+  ✅ أمر /addadmin لإضافة أدمن بدون إعادة نشر
+  ✅ أمر /shuffle لخلط ترتيب الأسئلة
+  ✅ شريط تقدم بنسبة مئوية أدق
+  ✅ رسالة /help منفصلة وأوضح
+  ✅ error handler عالمي مع logging
 """
 
 from __future__ import annotations
@@ -11,10 +26,9 @@ import asyncio
 import io
 import logging
 import os
+import random
 import re
 import sys
-import textwrap
-import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,32 +39,34 @@ from telegram import (
 )
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
+    AIORateLimiter,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PicklePersistence,
     filters,
 )
 
-# ── اختياريات ──────────────────────────────────────────────────────────────
+# ── مكتبات اختيارية ────────────────────────────────────────────────────────
 try:
     from docx import Document as DocxDocument
 except ImportError:
     DocxDocument = None
 
 try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
     from PyPDF2 import PdfReader
 except ImportError:
     PdfReader = None
 
-try:
-    import pdfplumber  # أفضل من PyPDF2 لاستخراج النصوص
-except ImportError:
-    pdfplumber = None
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  إعداد السجلات
+#  السجلات
 # ═══════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
@@ -75,37 +91,52 @@ def _parse_ids(*env_names: str) -> set[int]:
     return ids
 
 
-ADMIN_IDS: set[int] = _parse_ids("ADMIN_ID", "ADMIN_IDS") | {8693892771}
+# مجموعة الأدمن الأساسية من البيئة + الثابت
+_BASE_ADMIN_IDS: set[int] = _parse_ids("ADMIN_ID", "ADMIN_IDS") | {8693892771}
 
 CHANNEL_LABEL      = "𝐏𝐬𝐞𝐮𝐝𝐨𝐬𝐜𝐢𝐞𝐧𝐜𝐞"
 MAIN_CHANNEL       = os.environ.get("MAIN_CHANNEL", "@mj515678")
-SEND_DELAY         = float(os.environ.get("SEND_DELAY",        "0.5"))
+DEFAULT_SEND_DELAY = float(os.environ.get("SEND_DELAY",        "0.5"))
 BUFFER_DELAY       = float(os.environ.get("BUFFER_DELAY",      "2.0"))
 IMAGE_BUFFER_DELAY = float(os.environ.get("IMAGE_BUFFER_DELAY","4.0"))
+PERSISTENCE_FILE   = os.environ.get("PERSISTENCE_FILE", "bot_data.pkl")
 
-MAX_Q              = 300      # حد Telegram لنص السؤال
-MAX_OPT            = 100      # حد Telegram للخيار
-TG_MSG_LIMIT       = 4096
-TG_MAX_POLL_OPTS   = 10
-MAX_QUESTIONS      = 500      # حد واحدة قائمة لحماية الذاكرة
-MAX_SAVED          = 2000     # حد المحفوظات
+MAX_Q            = 300
+MAX_OPT          = 100
+TG_MSG_LIMIT     = 4096
+TG_MAX_POLL_OPTS = 10
+MAX_QUESTIONS    = 500
+MAX_SAVED        = 2000
 
-# وجهات الإرسال
 SEND_DESTINATIONS: dict[str, str] = {
     "📡 قناتي الرئيسية": MAIN_CHANNEL,
     "💬 نفس المحادثة":   "SAME_CHAT",
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  إدارة الأدمن الديناميكية (تُخزن في bot_data للـ persistence)
+# ═══════════════════════════════════════════════════════════════════════════
+def get_all_admins(bot_data: dict) -> set[int]:
+    """يجمع الأدمن الأساسيين مع الديناميكيين."""
+    return _BASE_ADMIN_IDS | set(bot_data.get("dynamic_admins", set()))
+
+
+def is_admin(user_id: int, bot_data: dict | None = None) -> bool:
+    if bot_data is None:
+        return user_id in _BASE_ADMIN_IDS
+    return user_id in get_all_admins(bot_data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  بنية السؤال
 # ═══════════════════════════════════════════════════════════════════════════
 @dataclass
 class Question:
-    question: str
-    options:  list[str]
-    correct:  int
-    image:    str | None = None
-    explanation: str | None = None  # شرح الإجابة (اختياري)
+    question:    str
+    options:     list[str]
+    correct:     int
+    image:       str | None = None
+    explanation: str | None = None
 
     def is_valid(self) -> bool:
         return (
@@ -135,26 +166,37 @@ class Question:
         )
 
 
+def _ensure_question_objects(qs: list) -> list[Question]:
+    result = []
+    for q in qs:
+        if isinstance(q, Question):
+            result.append(q)
+        elif isinstance(q, dict):
+            result.append(Question.from_dict(q))
+        else:
+            logger.warning("نوع سؤال غير معروف: %s", type(q))
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  أدوات النص
 # ═══════════════════════════════════════════════════════════════════════════
 def normalize_text(text: str) -> str:
-    """تطبيع: توحيد المسافات، تنظيف Unicode، إزالة BOM."""
+    """
+    تطبيع النص: توحيد أسطر، إزالة BOM وZWS.
+    ملاحظة: لا نُوحّد الهمزات/الياء هنا لأن ذلك يُفسد المطابقة
+    الدقيقة لنصوص الأسئلة المحتوية على مصطلحات علمية عربية.
+    """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\u200b", "").replace("\ufeff", "")  # zero-width + BOM
-    # توحيد الهمزات والألفات (اختياري لمطابقة أفضل)
-    text = re.sub(r"[أإآ]", "ا", text)
-    # توحيد الياء والتاء المربوطة
-    text = re.sub(r"[ىة]$", lambda m: "ة" if m.group() == "ة" else "ي", text)
+    text = text.replace("\u200b", "").replace("\u200c", "").replace("\ufeff", "")
     return text
 
 
 def clean_option(opt: str) -> str:
-    """تنظيف نهاية الخيار من النقاط والمسافات الزائدة."""
     opt = opt.strip()
-    opt = re.sub(r"\s*\.{2,}\s*$", "", opt)   # ... أو .. في النهاية
-    opt = re.sub(r"\s*\.\s*$", "", opt)         # نقطة واحدة
-    opt = re.sub(r"\s+", " ", opt)              # مسافات متعددة
+    opt = re.sub(r"\s*\.{2,}\s*$", "", opt)
+    opt = re.sub(r"\s*\.\s*$",    "", opt)
+    opt = re.sub(r"\s+",          " ", opt)
     return opt.strip()
 
 
@@ -177,36 +219,27 @@ def split_message(text: str, size: int = 4000) -> list[str]:
 
 
 def extract_text_from_file(filename: str, data: bytes) -> str:
-    """استخراج النص من txt/docx/pdf مع دعم pdfplumber كخيار أفضل."""
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "txt"
 
     if ext == "docx":
         if DocxDocument is None:
             raise RuntimeError("python-docx غير مثبتة — أضفها لـ requirements.txt")
         doc = DocxDocument(io.BytesIO(data))
-        lines: list[str] = []
-        for para in doc.paragraphs:
-            lines.append(para.text)
-        # جداول docx
+        lines: list[str] = [p.text for p in doc.paragraphs]
         for table in doc.tables:
             for row in table.rows:
                 lines.append("\t".join(cell.text for cell in row.cells))
         return "\n".join(lines)
 
     if ext == "pdf":
-        # الأولوية: pdfplumber > PyPDF2
         if pdfplumber is not None:
             with pdfplumber.open(io.BytesIO(data)) as pdf:
-                pages = [p.extract_text() or "" for p in pdf.pages]
-            return "\n".join(pages)
+                return "\n".join(p.extract_text() or "" for p in pdf.pages)
         if PdfReader is not None:
             reader = PdfReader(io.BytesIO(data))
-            return "\n".join(
-                (page.extract_text() or "") for page in reader.pages
-            )
-        raise RuntimeError("لا توجد مكتبة PDF — أضف pdfplumber أو PyPDF2")
+            return "\n".join((page.extract_text() or "") for page in reader.pages)
+        raise RuntimeError("لا توجد مكتبة PDF — أضف pdfplumber أو PyPDF2 لـ requirements.txt")
 
-    # txt (أو أي ملف نصي)
     for enc in ("utf-8", "utf-8-sig", "cp1256", "latin-1"):
         try:
             return data.decode(enc)
@@ -218,7 +251,6 @@ def extract_text_from_file(filename: str, data: bytes) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 #  تحليل قيمة الإجابة
 # ═══════════════════════════════════════════════════════════════════════════
-# أنماط ALL / NONE / MULTI / حرف منفرد
 _ALL_PAT = re.compile(
     r"^(?:"
     r"ALL(?:\s+OF\s+(?:THE\s+)?ABOVE)?"
@@ -241,27 +273,30 @@ _MULTI_LETTER_PAT = re.compile(
     r"^[A-Ja-j](?:\s*(?:and|or|و|،|,|&|\+|/)\s*[A-Ja-j])+$",
     re.I | re.U,
 )
+# خريطة الحروف العربية → رقم الخيار
+_AR_OPT_MAP = {"أ": 0, "ا": 0, "ب": 1, "ج": 2, "د": 3, "هـ": 4, "ه": 4, "و": 5}
 
-AnswerValue = int | str | None   # int=0-9, "ALL", "NONE", "MULTI:XY", None
+AnswerValue = int | str | None
 
 
 def parse_answer_value(raw: str) -> AnswerValue:
-    """تحويل نص الإجابة الخام إلى قيمة داخلية."""
     s = raw.strip()
 
     if _ALL_PAT.match(s):
         return "ALL"
     if _NONE_PAT.match(s):
         return "NONE"
-
-    # متعددة صريحة: B&D, A,C, A and C
     if _MULTI_LETTER_PAT.match(s):
         letters = re.findall(r"\b([A-Ja-j])\b", s, re.I)
         unique  = list(dict.fromkeys(l.upper() for l in letters))
         if len(unique) > 1:
             return f"MULTI:{''.join(unique)}"
 
-    # حرف واحد فقط (word boundary لتجنب حروف ALL/NONE)
+    # حرف عربي منفرد
+    for ar, idx in _AR_OPT_MAP.items():
+        if s == ar:
+            return idx
+
     letters = re.findall(r"\b([A-Ja-j])\b", s, re.I)
     if len(letters) == 1:
         return ord(letters[0].upper()) - ord("A")
@@ -272,28 +307,25 @@ def parse_answer_value(raw: str) -> AnswerValue:
     return None
 
 
-def build_multi_option(
-    opts: list[str], letters: str, clean_fn=clean_option
-) -> tuple[list[str], int]:
-    """
-    يبني خيار مدمج (B & D كلاهما صحيح) كآخر خيار.
-    يعيد (new_options, correct_index).
-    """
+def build_multi_option(opts: list[str], letters: str) -> tuple[list[str], int]:
     label = " & ".join(letters)
     combo = f"({label}) كلاهما صحيح ✔"
-    new_opts = [clean_fn(o) for o in opts] + [combo]
+    new_opts = [clean_option(o) for o in opts] + [combo]
     return new_opts, len(new_opts) - 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  محلّل الأسئلة الرئيسي
+#  محلّل الأسئلة
 # ═══════════════════════════════════════════════════════════════════════════
-# ── أنماط التعرف ────────────────────────────────────────────────────────
+# خيارات لاتينية: A) A. A- (A)
+_OPT_LAT = re.compile(r"^([A-Ja-j])\s*[.):\-]\s*|^\(([A-Ja-j])\)\s*", re.I)
+# خيارات عربية: أ) أ. ب) ب. ج) ج. د)
+_OPT_AR  = re.compile(r"^([أابجدهو]|هـ)\s*[.)\-:]\s*", re.U)
+
 _Q_PAT = re.compile(
     r"^(?:Q(?:uestion|s?\.?)?\s*)?(\d+)\s*[.)\-:؟\s]\s*",
     re.I,
 )
-_OPT_PAT = re.compile(r"^([A-Ja-j])\s*[.):\-]\s*", re.I)
 _ANS_KEYWORD = re.compile(
     r"^(?:"
     r"Correct\s*Answer|Answer|Answers?|Ans|Correct"
@@ -301,90 +333,86 @@ _ANS_KEYWORD = re.compile(
     r")\s*[:=\-]\s*",
     re.I | re.U,
 )
-_ANS_ONLY   = re.compile(r"^([A-Ja-j])\s*$", re.I)
+_ANS_ONLY   = re.compile(r"^([A-Ja-j])\s*$",                  re.I)
+_ANS_AR_ONLY= re.compile(r"^([أابجدهو]|هـ)\s*$",              re.U)
 _KEY_LINE   = re.compile(r"^(\d+)\s*[-.):\s]\s*([A-Ja-j])\s*$", re.I)
 _KEY_HDR    = re.compile(
     r"^(?:answers?\s*key|answer\s*key|key|answers?|الإجابات?|مفتاح\s*الإجابات?)\s*:?\s*$",
     re.I | re.U,
 )
 _INLINE_OPT = re.compile(r"([A-Ja-j])\s*[.)]\s*(.*?)(?=\s+[A-Ja-j]\s*[.)]|$)", re.I)
-_DIVIDER    = re.compile(r"^[-_=*#]{3,}\s*$")  # خطوط فاصلة
-
-# تعرف على بداية سؤال جديد بدون رقم (Stem قائم بذاته)
+_DIVIDER    = re.compile(r"^[-_=*#]{3,}\s*$")
 _STEM_START = re.compile(
-    r"^(?:Which|What|Who|When|Where|How|Why|Choose|Select|True|False|ما|من|أي|اختر|حدد|صح|خطأ)\b",
+    r"^(?:Which|What|Who|When|Where|How|Why|Choose|Select|True|False"
+    r"|ما|من|أي|اختر|حدد|صح|خطأ|هل)\b",
     re.I | re.U,
 )
-
-# شرح الإجابة
-_EXPL_PAT = re.compile(
+_TF_PAT     = re.compile(r"^(True|False|صح|خطأ|نعم|لا)\s*$", re.I | re.U)
+_EXPL_PAT   = re.compile(
     r"^(?:Explanation|Rationale|Note|ملاحظة|الشرح|التفسير|السبب)\s*[:=\-]\s*",
     re.I | re.U,
 )
 
 
+def _match_option(line: str) -> tuple[bool, str]:
+    """يتحقق إن كان السطر خياراً ويُعيد (True, نص_الخيار) أو (False, '')."""
+    m = _OPT_LAT.match(line)
+    if m:
+        return True, line[m.end():].strip()
+    m = _OPT_AR.match(line)
+    if m:
+        return True, line[m.end():].strip()
+    return False, ""
+
+
+def _parse_inline(line: str) -> list[str]:
+    m = _INLINE_OPT.findall(line)
+    return [clean_option(t) for _, t in m] if len(m) >= 2 else []
+
+
 def extract_questions(raw_text: str) -> list[Question]:
-    """
-    المحلّل الرئيسي — يدعم:
-    • ترقيم الأسئلة (1. / Q1 / Q.1)
-    • بدون ترقيم (stem مباشرة)
-    • خيارات A) / A. / A- / (A)
-    • إجابات: حرف / ALL / NONE / متعدد (B&D)
-    • Answer Key منفصل في نهاية الملف
-    • أسئلة متراكمة بدون فاصل
-    • شرح الإجابة (Explanation:)
-    • خيارات inline: A. opt1  B. opt2  C. opt3
-    """
     text  = normalize_text(raw_text)
     lines = text.splitlines()
 
-    # ── 1. كشف Answer Key منفصل ─────────────────────────────────────────
-    answer_key: dict[int, str]  = {}
-    key_lines:  set[int]        = set()
-    in_key_section              = False
+    # ── 1. Answer Key منفصل ─────────────────────────────────────────────
+    answer_key: dict[int, str] = {}
+    key_lines:  set[int]       = set()
+    in_key = False
 
     for i, raw in enumerate(lines):
         s = raw.strip()
         if _KEY_HDR.match(s):
-            in_key_section = True
+            in_key = True
             key_lines.add(i)
             continue
-        if in_key_section:
+        if in_key:
             m = _KEY_LINE.match(s)
             if m:
                 answer_key[int(m.group(1))] = m.group(2).upper()
                 key_lines.add(i)
             elif s and not _DIVIDER.match(s):
-                in_key_section = False  # خرجنا من قسم المفتاح
+                in_key = False
 
-    # لا نعتمد المفتاح إلا إذا كان فيه 3 مدخلات على الأقل
     if len(key_lines) < 3:
         answer_key, key_lines = {}, set()
 
-    # ── 2. تجميع السياق لكل سطر ─────────────────────────────────────────
-    questions: list[Question]  = []
-    cur_q:     list[str]       = []
-    cur_opts:  list[str]       = []
-    cur_ans:   AnswerValue     = None
-    cur_expl:  str | None      = None
-    cur_num:   int | None      = None
-    cur_img:   str | None      = None
-    opt_idx:   int             = -1
-    auto_ctr:  int             = 0
-
-    def _parse_inline(line: str) -> list[str]:
-        m = _INLINE_OPT.findall(line)
-        return [clean_option(t) for _, t in m] if len(m) >= 2 else []
+    # ── 2. تحليل السطر سطراً ────────────────────────────────────────────
+    questions: list[Question] = []
+    cur_q:     list[str]      = []
+    cur_opts:  list[str]      = []
+    cur_ans:   AnswerValue    = None
+    cur_expl:  str | None     = None
+    cur_num:   int | None     = None
+    cur_img:   str | None     = None
+    opt_idx:   int            = -1
+    auto_ctr:  int            = 0
 
     def flush():
         nonlocal cur_ans
         if not cur_q:
             return
-
-        # استرجاع الإجابة من المفتاح إذا لم تُكتشف
         if cur_ans is None and cur_num is not None and cur_num in answer_key:
             cur_ans = ord(answer_key[cur_num]) - ord("A")
-
         if cur_ans is None or len(cur_opts) < 2:
             return
 
@@ -422,58 +450,68 @@ def extract_questions(raw_text: str) -> list[Question]:
 
         line = raw.strip()
 
-        # سطر فارغ أو فاصل
         if not line or _DIVIDER.match(line):
             if cur_ans is not None and cur_opts:
                 flush(); reset()
             continue
 
-        # رأس Answer Key
         if _KEY_HDR.match(line):
             if cur_q:
                 flush(); reset()
             continue
 
-        # ── شرح الإجابة ──
+        # شرح
         m_expl = _EXPL_PAT.match(line)
         if m_expl:
             cur_expl = line[m_expl.end():].strip()
             continue
 
-        # ── سؤال برقم ──
+        # سؤال برقم
         m_q = _Q_PAT.match(line)
         if m_q and not _ANS_KEYWORD.match(line):
             flush()
             auto_ctr += 1
-            cur_num  = int(m_q.group(1))
-            cur_q    = [line[m_q.end():].strip()]
+            cur_num = int(m_q.group(1))
+            cur_q   = [line[m_q.end():].strip()]
             cur_opts, cur_ans, cur_expl, cur_img, opt_idx = [], None, None, None, -1
             continue
 
-        # ── سطر الإجابة ──
+        # إجابة صريحة
         m_ans = _ANS_KEYWORD.match(line)
         if m_ans:
             cur_ans = parse_answer_value(line[m_ans.end():].strip())
             continue
 
-        # ── خيار ──
-        m_opt = _OPT_PAT.match(line)
-        if m_opt:
+        # خيار (لاتيني أو عربي)
+        is_opt, opt_text = _match_option(line)
+        if is_opt:
             inline = _parse_inline(line)
             if inline:
                 cur_opts = inline
                 opt_idx  = len(cur_opts) - 1
             else:
-                cur_opts.append(line[m_opt.end():].strip())
+                cur_opts.append(opt_text)
                 opt_idx = len(cur_opts) - 1
             continue
 
-        # ── حرف وحيد كإجابة (بعد خيارات وقبل إجابة صريحة) ──
-        if opt_idx >= 0 and cur_ans is None and _ANS_ONLY.match(line):
-            cur_ans = parse_answer_value(line)
+        # حرف/حرف عربي وحيد كإجابة بعد الخيارات
+        if opt_idx >= 0 and cur_ans is None:
+            if _ANS_ONLY.match(line):
+                cur_ans = parse_answer_value(line)
+                continue
+            if _ANS_AR_ONLY.match(line):
+                cur_ans = _AR_OPT_MAP.get(line.strip(), None)
+                continue
+
+        # True/False تلقائياً → يُنشئ سؤالاً ثنائياً
+        if _TF_PAT.match(line) and not cur_opts:
+            tf_correct = 0 if re.match(r"^(True|صح|نعم)$", line, re.I | re.U) else 1
+            if cur_q:
+                cur_opts = ["صح ✅", "خطأ ❌"]
+                cur_ans  = tf_correct
             continue
 
-        # ── استمرار الخيار الحالي ──
+        # استمرار الخيار
         if opt_idx >= 0 and cur_ans is None:
             inline = _parse_inline(line)
             if inline:
@@ -483,22 +521,22 @@ def extract_questions(raw_text: str) -> list[Question]:
                 cur_opts[opt_idx] += " " + line
             continue
 
-        # ── استمرار نص السؤال ──
+        # استمرار السؤال
         if cur_q and cur_ans is None and opt_idx < 0:
             cur_q.append(line)
             continue
 
-        # ── سؤال جديد بدون رقم (تعرف على الـ stem) ──
+        # سؤال جديد بدون رقم
         if _STEM_START.match(line):
             flush()
             auto_ctr += 1
-            cur_num  = auto_ctr
-            cur_q    = [line]
+            cur_num = auto_ctr
+            cur_q   = [line]
             cur_opts, cur_ans, cur_expl, cur_img, opt_idx = [], None, None, None, -1
             continue
 
     flush()
-    logger.info("✅ تم استخراج %d سؤال", len(questions))
+    logger.info("✅ استُخرج %d سؤال", len(questions))
     return questions
 
 
@@ -506,37 +544,37 @@ def extract_questions(raw_text: str) -> list[Question]:
 #  محلّل خيارات الصور
 # ═══════════════════════════════════════════════════════════════════════════
 def extract_options_and_answer(text: str) -> tuple[list[str] | None, int | None]:
-    """يحلل نص الخيارات والإجابة للأسئلة المصوّرة."""
     lines   = normalize_text(text).strip().splitlines()
-    opts:   list[str]   = []
+    opts:    list[str] = []
     raw_ans: str | None = None
-    opt_idx: int        = -1
+    opt_idx: int = -1
 
     for raw in lines:
         line = raw.strip()
         if not line:
             continue
-
         m_ans = _ANS_KEYWORD.match(line)
         if m_ans:
             raw_ans = line[m_ans.end():].strip()
             continue
 
-        m_opt = _OPT_PAT.match(line)
-        if m_opt:
+        is_opt, opt_text = _match_option(line)
+        if is_opt:
             inline = _INLINE_OPT.findall(line)
             if len(inline) >= 2:
                 opts    = [clean_option(t) for _, t in inline]
                 opt_idx = len(opts) - 1
             else:
-                opts.append(clean_option(line[m_opt.end():].strip()))
+                opts.append(clean_option(opt_text))
                 opt_idx = len(opts) - 1
             continue
 
         if opt_idx >= 0 and raw_ans is None and _ANS_ONLY.match(line):
             raw_ans = line
             continue
-
+        if opt_idx >= 0 and raw_ans is None and _ANS_AR_ONLY.match(line):
+            raw_ans = line
+            continue
         if opt_idx >= 0 and raw_ans is None:
             opts[opt_idx] += " " + line.strip()
             continue
@@ -547,18 +585,37 @@ def extract_options_and_answer(text: str) -> tuple[list[str] | None, int | None]
     ans = parse_answer_value(raw_ans)
 
     if ans == "ALL":
-        new_opts = opts + ["All of the above ✔"]
-        return new_opts, len(new_opts) - 1
+        new = opts + ["All of the above ✔"]
+        return new, len(new) - 1
     if ans == "NONE":
-        new_opts = opts + ["None of the above ✔"]
-        return new_opts, len(new_opts) - 1
+        new = opts + ["None of the above ✔"]
+        return new, len(new) - 1
     if isinstance(ans, str) and ans.startswith("MULTI:"):
-        new_opts, correct = build_multi_option(opts, ans[6:])
-        return new_opts, correct
+        new, correct = build_multi_option(opts, ans[6:])
+        return new, correct
     if isinstance(ans, int) and ans < len(opts):
         return [clean_option(o) for o in opts], ans
 
     return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  الحماية من التزامن — Lock Pool مع تنظيف تلقائي
+# ═══════════════════════════════════════════════════════════════════════════
+_send_locks: dict[int, asyncio.Lock] = {}
+
+
+def get_send_lock(chat_id: int) -> asyncio.Lock:
+    if chat_id not in _send_locks:
+        _send_locks[chat_id] = asyncio.Lock()
+    return _send_locks[chat_id]
+
+
+def cleanup_lock(chat_id: int):
+    """يُزيل Lock بعد الانتهاء لمنع memory leak في حالات الشات الكثيرة."""
+    lock = _send_locks.get(chat_id)
+    if lock and not lock.locked():
+        _send_locks.pop(chat_id, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -574,24 +631,29 @@ async def send_polls(
     control_chat_id: Any = None,
 ) -> tuple[int, list[dict]]:
     """
-    يرسل الأسئلة كاستطلاعات.
-    يعيد (success_count, failed_list).
+    يرسل الأسئلة كـ Quiz Polls.
+    - AIORateLimiter يتولى حدود Telegram تلقائياً
+    - Exponential back-off للأخطاء العامة
+    - شريط تقدم بصري دقيق
     """
     control_chat_id = control_chat_id or chat_id
     flags = ctx.bot_data.setdefault("cancel_flags", {})
     flags[control_chat_id] = False
 
-    failed: list[dict] = []
-    success = 0
-    total   = len(questions)
+    # التأخير الخاص بهذا المستخدم أو الافتراضي
+    send_delay = ctx.user_data.get("send_delay", DEFAULT_SEND_DELAY)
+
+    failed:  list[dict] = []
+    success: int = 0
+    total:   int = len(questions)
 
     for i in range(start_index, total):
         if flags.get(control_chat_id):
             logger.info("إلغاء بواسطة المستخدم عند السؤال %d", i + 1)
             break
 
-        q   = questions[i]
-        qn  = i + 1
+        q  = questions[i]
+        qn = i + 1
 
         if not q.is_valid():
             logger.warning("سؤال غير صالح #%d، تخطي", qn)
@@ -601,16 +663,16 @@ async def send_polls(
         poll_question = q.question
         poll_options  = list(q.options)
 
-        # ── صورة ──
+        # ── صورة ──────────────────────────────────────────────────────────
         if q.image:
             try:
-                cap = q.question[:1024] or "اختر الإجابة الصحيحة 👆"
+                cap = (q.question[:1024]) if q.question else "اختر الإجابة الصحيحة 👆"
                 await bot.send_photo(chat_id=chat_id, photo=q.image, caption=cap)
             except TelegramError as e:
-                logger.warning("فشل إرسال الصورة: %s", e)
+                logger.warning("فشل إرسال الصورة للسؤال #%d: %s", qn, e)
             poll_question = "اختر الإجابة الصحيحة 👆"
 
-        # ── نص أو خيارات طويلة ──
+        # ── نص أو خيارات طويلة ───────────────────────────────────────────
         elif len(q.question) > MAX_Q or any(len(o) > MAX_OPT for o in q.options):
             full_text = q.question
             if any(len(o) > MAX_OPT for o in q.options):
@@ -626,12 +688,12 @@ async def send_polls(
             if len(q.question) > MAX_Q:
                 poll_question = "Choose the correct answer 👆"
 
-        # ── إضافة شعار القناة كخيار أخير ──
+        # ── تجهيز الخيارات ───────────────────────────────────────────────
         opts = [o[:MAX_OPT] for o in poll_options]
         if len(opts) < TG_MAX_POLL_OPTS:
             opts.append(CHANNEL_LABEL[:MAX_OPT])
 
-        # ── إرسال مع retry تلقائي ──
+        # ── إرسال الاستطلاع مع retry ─────────────────────────────────────
         sent_ok = False
         retries = 0
         while retries < 5:
@@ -650,25 +712,31 @@ async def send_polls(
                 success += 1
                 sent_ok = True
                 break
+
             except RetryAfter as e:
+                # AIORateLimiter يعالج معظمها، لكن هذا احتياطي
                 wait = e.retry_after + 1
                 logger.info("RetryAfter %ds للسؤال #%d", wait, qn)
                 await asyncio.sleep(wait)
                 retries += 1
+
             except BadRequest as e:
                 logger.error("BadRequest للسؤال #%d: %s", qn, e)
                 failed.append({"index": qn, "question": q.question, "reason": str(e)})
                 break
+
             except Forbidden as e:
-                logger.error("Forbidden: %s — توقف الإرسال", e)
+                logger.error("Forbidden — إيقاف الإرسال: %s", e)
                 failed.append({"index": qn, "question": q.question, "reason": str(e)})
-                # لا فائدة من الاستمرار
                 flags[control_chat_id] = True
                 break
+
             except TelegramError as e:
                 retries += 1
-                logger.warning("TelegramError للسؤال #%d (محاولة %d): %s", qn, retries, e)
-                await asyncio.sleep(2 ** retries)  # exponential back-off
+                wait = 2 ** retries
+                logger.warning("TelegramError #%d (محاولة %d، انتظار %ds): %s", qn, retries, wait, e)
+                await asyncio.sleep(wait)
+
             except Exception as e:
                 logger.exception("خطأ غير متوقع للسؤال #%d", qn)
                 failed.append({"index": qn, "question": q.question, "reason": str(e)})
@@ -676,33 +744,34 @@ async def send_polls(
 
         if sent_ok:
             ctx.user_data["last_sent"] = qn
-        elif not sent_ok and not flags.get(control_chat_id) and retries >= 5:
+        elif retries >= 5:
             failed.append({"index": qn, "question": q.question, "reason": "max_retries"})
 
-        # تحديث التقدم كل 10 أسئلة أو آخر سؤال
-        if progress_msg and (qn % 10 == 0 or qn == total):
-            try:
-                pct = int(qn / total * 100)
-                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-                await progress_msg.edit_text(
-                    f"🚀 [{bar}] {pct}%\n"
-                    f"({qn}/{total}) — ✅ {success} | ❌ {len(failed)}"
-                )
-            except TelegramError:
-                pass
-
-        # إرسال شرح الإجابة كرسالة منفصلة إذا وُجد ولم يُرسل مع الـ poll
+        # ── شرح الإجابة الطويل كرسالة منفصلة ──────────────────────────────
         if q.explanation and len(q.explanation) > 200:
             try:
                 await bot.send_message(
-                    chat_id = chat_id,
-                    text    = f"💡 *شرح الإجابة:*\n{q.explanation}",
+                    chat_id    = chat_id,
+                    text       = f"💡 *شرح الإجابة:*\n{q.explanation}",
                     parse_mode = "Markdown",
                 )
             except TelegramError:
                 pass
 
-        await asyncio.sleep(SEND_DELAY)
+        # ── شريط التقدم ──────────────────────────────────────────────────
+        if progress_msg and (qn % 10 == 0 or qn == total):
+            try:
+                pct = int(qn / total * 100)
+                filled = pct // 10
+                bar = "█" * filled + "░" * (10 - filled)
+                await progress_msg.edit_text(
+                    f"🚀 [{bar}] {pct}%\n"
+                    f"السؤال {qn}/{total} — ✅ {success} نجح | ❌ {len(failed)} فشل"
+                )
+            except TelegramError:
+                pass
+
+        await asyncio.sleep(send_delay)
 
     flags[control_chat_id] = False
     logger.info("إرسال منتهٍ: ✅ %d | ❌ %d", success, len(failed))
@@ -713,22 +782,20 @@ async def send_failed_file(bot, chat_id: Any, failed: list[dict]):
     if not failed:
         return
     lines = [
-        f"#{item['index']}: {item['question']}\n"
-        f"   السبب: {item.get('reason', 'unknown')}"
+        f"#{item['index']}: {item['question']}\n   السبب: {item.get('reason','unknown')}"
         for item in failed
     ]
-    content = "\n\n".join(lines)
-    buf      = io.BytesIO(content.encode("utf-8"))
+    buf      = io.BytesIO("\n\n".join(lines).encode("utf-8"))
     buf.name = "failed_questions.txt"
     try:
         await bot.send_document(
             chat_id  = chat_id,
             document = buf,
             filename = "failed_questions.txt",
-            caption  = f"📋 قائمة {len(failed)} سؤال فاشل",
+            caption  = f"📋 {len(failed)} سؤال فشل إرساله",
         )
     except TelegramError as e:
-        logger.warning("فشل إرسال ملف الفاشلة: %s", e)
+        logger.warning("فشل إرسال ملف الأخطاء: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -745,37 +812,18 @@ def dest_keyboard(prefix: str = "dest") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def confirm_keyboard(action: str, yes_label: str = "✅ نعم", no_label: str = "❌ لا") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(yes_label, callback_data=f"confirm:{action}:yes"),
-        InlineKeyboardButton(no_label,  callback_data=f"confirm:{action}:no"),
-    ]])
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  الحماية من التزامن
-# ═══════════════════════════════════════════════════════════════════════════
-_send_locks: dict[int, asyncio.Lock] = {}
-
-def get_send_lock(chat_id: int) -> asyncio.Lock:
-    if chat_id not in _send_locks:
-        _send_locks[chat_id] = asyncio.Lock()
-    return _send_locks[chat_id]
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  معالجة الصور
 # ═══════════════════════════════════════════════════════════════════════════
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
 
     chat_id = update.effective_chat.id
-    photo   = update.message.photo[-1]   # أعلى دقة
+    photo   = update.message.photo[-1]
     file_id = photo.file_id
     caption = (update.message.caption or "").strip()
 
-    # إذا كان الـ caption يحتوي خيارات + إجابة
     if caption:
         opts, ans = extract_options_and_answer(caption)
         if opts and ans is not None:
@@ -783,16 +831,17 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _queue_image_question(update, ctx, file_id, q_text, opts, ans)
             return
 
-    # احتفظ بالصورة وانتظر الرسالة التالية
     ctx.bot_data.setdefault("pending_images", {})[chat_id] = {
         "file_id": file_id,
         "caption": caption,
     }
-    _reset_image_timer(ctx, chat_id, update)
+    _reset_image_timer(ctx, chat_id)
     await update.message.reply_text(
         "📸 *استلمت الصورة!*\n\n"
-        "أرسل الآن الخيارات والإجابة بالصيغة:\n"
-        "```\nA. الخيار الأول\nB. الخيار الثاني\nC. الخيار الثالث\nD. الخيار الرابع\nAnswer: B\n```",
+        "أرسل الخيارات والإجابة بأي صيغة:\n"
+        "```\nA. الخيار الأول\nB. الخيار الثاني\nC. الخيار الثالث\nD. الخيار الرابع\nAnswer: B\n```\n\n"
+        "أو بالعربي:\n"
+        "```\nأ. الخيار الأول\nب. الخيار الثاني\nج. الخيار الثالث\nالإجابة: ب\n```",
         parse_mode="Markdown",
     )
 
@@ -803,13 +852,14 @@ def _extract_question_from_caption(caption: str) -> str:
         line = line.strip()
         if not line:
             continue
-        if _OPT_PAT.match(line) or _ANS_KEYWORD.match(line):
+        is_opt, _ = _match_option(line)
+        if is_opt or _ANS_KEYWORD.match(line):
             break
         q_lines.append(line)
     return " ".join(q_lines).strip() or "اختر الإجابة الصحيحة"
 
 
-def _reset_image_timer(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, update: Update):
+def _reset_image_timer(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
     timers = ctx.bot_data.setdefault("image_timers", {})
     old = timers.get(chat_id)
     if old:
@@ -825,7 +875,7 @@ def _reset_image_timer(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, update: Upd
                 await ctx.bot.send_message(
                     chat_id,
                     "⏰ انتهى وقت الانتظار.\n"
-                    "أرسل الصورة مجدداً مع الخيارات في الـ caption، أو أرسل الصورة ثم الخيارات مباشرة.",
+                    "أرسل الصورة مجدداً مع الخيارات في الـ caption أو أرسلها ثم الخيارات.",
                 )
             except TelegramError:
                 pass
@@ -843,8 +893,7 @@ async def _queue_image_question(
         correct= ans,
         image=   file_id,
     )
-    existing: list[Question] = ctx.user_data.get("questions", [])
-
+    existing: list = ctx.user_data.get("questions", [])
     if len(existing) >= MAX_QUESTIONS:
         await update.message.reply_text(
             f"⚠️ وصلت للحد الأقصى ({MAX_QUESTIONS} سؤال). استخدم /send أو /clear أولاً."
@@ -861,16 +910,16 @@ async def _queue_image_question(
         })
         await update.message.reply_text(
             "✅ تم استخراج سؤال مصوّر *(1 سؤال)*\n\n📤 أين تريد الإرسال؟",
-            reply_markup = dest_keyboard(),
-            parse_mode   = "Markdown",
+            reply_markup=dest_keyboard(),
+            parse_mode="Markdown",
         )
     else:
         existing.append(q)
         ctx.user_data["questions"] = existing
         await update.message.reply_text(
-            f"✅ تمت إضافة السؤال المصوّر. الإجمالي: *{len(existing)}*\n"
-            "استخدم /send للإرسال أو تابع إضافة المزيد.",
-            parse_mode = "Markdown",
+            f"✅ أُضيف السؤال المصوّر. الإجمالي: *{len(existing)}*\n"
+            "استخدم /send للإرسال أو تابع الإضافة.",
+            parse_mode="Markdown",
         )
 
 
@@ -885,7 +934,6 @@ async def handle_text_after_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if opts is None:
         return False
 
-    # إلغاء المؤقت
     timer = ctx.bot_data.get("image_timers", {}).pop(chat_id, None)
     if timer:
         timer.cancel()
@@ -900,52 +948,56 @@ async def handle_text_after_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 # ═══════════════════════════════════════════════════════════════════════════
 #  أوامر البوت
 # ═══════════════════════════════════════════════════════════════════════════
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    uid = update.effective_user.id
+    if not is_admin(uid, ctx.bot_data):
         await update.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
         return
     await update.message.reply_text(
-        "👋 *أهلاً بك في بوت الكويز المثالي!*\n\n"
+        "👋 *أهلاً بك في بوت الكويز!*\n\n"
+        "أرسل نصاً أو ملفاً (txt/docx/pdf) أو صورة.\n"
+        "للمساعدة الكاملة: /help",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
+        return
+    await update.message.reply_text(
+        "📖 *دليل الاستخدام الكامل*\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📋 *طرق الإدخال:*\n"
-        "📝 نص مباشر (كل الصيغ مدعومة)\n"
-        "📎 ملف: `txt` / `docx` / `pdf`\n"
-        "🖼 صورة + خيارات في نفس الرسالة أو بعدها\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 *صيغ الخيارات:*\n"
-        "`A.` أو `A)` أو `A-` أو `(A)`\n\n"
-        "📌 *صيغ الإجابة:*\n"
+        "📋 *صيغ الخيارات المدعومة:*\n"
+        "`A.` `A)` `A-` `(A)` — لاتينية\n"
+        "`أ.` `أ)` `ب.` `ج.` `د.` — عربية\n\n"
+        "📋 *صيغ الإجابة:*\n"
         "`Answer: B` · `Ans=C` · `Correct: D`\n"
-        "`الإجابة: A` · حرف منفرد\n"
+        "`الإجابة: أ` · حرف/حرف عربي منفرد\n"
         "`Answer: B&D` · `Answer: ALL` · `Answer: NONE`\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 *الشرح (اختياري):*\n"
-        "`Explanation: نص الشرح`\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📦 *وجهات الإرسال:*\n"
-        "📡 قناتي الرئيسية\n"
-        "💬 نفس المحادثة\n"
-        "📥 المحفوظات (للإرسال لاحقاً)\n\n"
+        "📋 *أسئلة True/False:*\n"
+        "بعد الإجابة اكتب `True` أو `False` أو `صح` أو `خطأ`\n\n"
+        "📋 *الشرح (اختياري):*\n"
+        "`Explanation: نص الشرح` أو `الشرح: ...`\n\n"
+        "📋 *مفتاح إجابات منفصل:*\n"
+        "`Answer Key`\n`1. A`\n`2. B`\n`3. C`\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔧 *الأوامر:*\n"
         "/send — إرسال الأسئلة الحالية\n"
         "/preview — معاينة أول 3 أسئلة\n"
+        "/shuffle — خلط ترتيب الأسئلة عشوائياً\n"
         "/saved — عرض المحفوظات\n"
         "/sendsaved — إرسال المحفوظات\n"
         "/clearsaved — مسح المحفوظات\n"
-        "/cancel — إيقاف الإرسال\n"
+        "/cancel — إيقاف الإرسال فوراً\n"
         "/resume — استئناف آخر عملية\n"
         "/status — الحالة الحالية\n"
-        "/stats — إحصائيات مفصّلة\n"
+        "/stats — إحصائيات الجلسة\n"
         "/clear — مسح الأسئلة الحالية\n"
-        "/myid — معرفة آيديك\n"
-        "/delay [ثواني] — ضبط التأخير بين الأسئلة\n"
-        "/test — إرسال سؤال اختبار",
-        parse_mode = "Markdown",
+        "/delay [ث] — ضبط التأخير (0.3–10)\n"
+        "/addadmin [ID] — إضافة أدمن مؤقت\n"
+        "/test — سؤال اختبار\n"
+        "/myid — معرفة آيديك",
+        parse_mode="Markdown",
     )
 
 
@@ -953,13 +1005,33 @@ async def cmd_myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(
         f"🆔 آيديك: `{uid}`\n"
-        f"{'✅ أنت مشرف' if is_admin(uid) else '⛔ لست مشرفاً'}",
-        parse_mode = "Markdown",
+        f"{'✅ أنت مشرف' if is_admin(uid, ctx.bot_data) else '⛔ لست مشرفاً'}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """إضافة أدمن ديناميكياً (يُحفظ بالـ persistence)."""
+    if not is_admin(update.effective_user.id, ctx.bot_data):
+        return
+    args = ctx.args
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "الاستخدام: `/addadmin 123456789`", parse_mode="Markdown"
+        )
+        return
+    new_id = int(args[0])
+    admins = ctx.bot_data.setdefault("dynamic_admins", set())
+    admins.add(new_id)
+    await update.message.reply_text(
+        f"✅ تمت إضافة `{new_id}` كأدمن.\n"
+        f"إجمالي الأدمن الآن: {len(get_all_admins(ctx.bot_data))}",
+        parse_mode="Markdown",
     )
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     chat_id = update.effective_chat.id
 
@@ -972,6 +1044,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.bot_data.get("pending_images", {}).pop(chat_id, None)
     ctx.bot_data.setdefault("cancel_flags", {})[chat_id] = True
     ctx.user_data["sending"] = False
+    cleanup_lock(chat_id)
 
     await update.message.reply_text(
         "✅ تم إلغاء العملية الحالية.\n"
@@ -980,19 +1053,21 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     chat_id   = update.effective_chat.id
-    questions = ctx.user_data.get("questions", [])
-    saved     = ctx.bot_data.get("saved_questions", {}).get(chat_id, [])
+    questions = _ensure_question_objects(ctx.user_data.get("questions", []))
+    saved     = _ensure_question_objects(
+        ctx.bot_data.get("saved_questions", {}).get(chat_id, [])
+    )
     last_sent = ctx.user_data.get("last_sent", 0)
     failed    = ctx.user_data.get("last_failed", [])
     sending   = ctx.user_data.get("sending", False)
     pending   = chat_id in ctx.bot_data.get("pending_images", {})
-    delay     = ctx.user_data.get("send_delay", SEND_DELAY)
+    delay     = ctx.user_data.get("send_delay", DEFAULT_SEND_DELAY)
 
-    img_q     = sum(1 for q in questions if (q.get("image") if isinstance(q, dict) else q.image))
-    saved_img = sum(1 for q in saved if (q.get("image") if isinstance(q, dict) else q.image))
+    img_q     = sum(1 for q in questions if q.image)
+    saved_img = sum(1 for q in saved if q.image)
 
     await update.message.reply_text(
         "📊 *الحالة الحالية:*\n\n"
@@ -1004,124 +1079,140 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"   • نصية: {len(saved) - saved_img} | مصوّرة: {saved_img}\n\n"
         f"🚀 إرسال جارٍ: {'نعم ⏳' if sending else 'لا'}\n"
         f"📸 صورة معلّقة: {'نعم ⏳' if pending else 'لا'}\n"
-        f"⏱ التأخير الحالي: {delay}s",
-        parse_mode = "Markdown",
+        f"⏱ التأخير: {delay}s",
+        parse_mode="Markdown",
     )
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """إحصائيات مفصّلة."""
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
-    chat_id = update.effective_chat.id
-    session = ctx.bot_data.get("session_stats", {}).get(chat_id, {})
-    total_sent   = session.get("total_sent",   0)
-    total_failed = session.get("total_failed", 0)
-    sessions     = session.get("sessions",     0)
+    chat_id  = update.effective_chat.id
+    session  = ctx.bot_data.get("session_stats", {}).get(chat_id, {})
+    total_s  = session.get("total_sent",   0)
+    total_f  = session.get("total_failed", 0)
+    sessions = session.get("sessions",     0)
+    rate     = total_s / max(total_s + total_f, 1) * 100
 
     await update.message.reply_text(
         "📈 *إحصائيات الجلسة:*\n\n"
-        f"📤 إجمالي المُرسل: {total_sent}\n"
-        f"❌ إجمالي الفاشل: {total_failed}\n"
-        f"🔄 عدد عمليات الإرسال: {sessions}\n"
-        f"📊 معدل النجاح: "
-        f"{total_sent / max(total_sent + total_failed, 1) * 100:.1f}%",
-        parse_mode = "Markdown",
+        f"📤 إجمالي المُرسل: *{total_s}*\n"
+        f"❌ إجمالي الفاشل: *{total_f}*\n"
+        f"🔄 عدد عمليات الإرسال: *{sessions}*\n"
+        f"📊 معدل النجاح: *{rate:.1f}%*",
+        parse_mode="Markdown",
     )
 
 
 async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """معاينة أول 3 أسئلة."""
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
-    questions = ctx.user_data.get("questions", [])
+    questions = _ensure_question_objects(ctx.user_data.get("questions", []))
     if not questions:
         await update.message.reply_text("⚠️ لا توجد أسئلة حالياً.")
         return
-    lines = [f"👁 *معاينة أول {min(3, len(questions))} أسئلة:*\n"]
-    for i, q in enumerate(questions[:3], 1):
-        qd = q if isinstance(q, dict) else q.to_dict()
+    n     = min(3, len(questions))
+    lines = [f"👁 *معاينة أول {n} أسئلة:*\n"]
+    for i, q in enumerate(questions[:n], 1):
         opts_text = "\n".join(
-            f"{'✅' if j == qd['correct'] else '  '} {chr(65+j)}. {o}"
-            for j, o in enumerate(qd["options"])
+            f"{'✅' if j == q.correct else '  '} {chr(65+j)}. {o}"
+            for j, o in enumerate(q.options)
         )
-        img_mark = " 🖼" if qd.get("image") else ""
-        lines.append(f"*{i}.{img_mark}* {qd['question'][:100]}\n{opts_text}")
-        if qd.get("explanation"):
-            lines.append(f"💡 _{qd['explanation'][:80]}_")
+        img_mark = " 🖼" if q.image else ""
+        lines.append(f"*{i}.{img_mark}* {q.question[:100]}\n{opts_text}")
+        if q.explanation:
+            lines.append(f"💡 _{q.explanation[:80]}_")
         lines.append("")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_shuffle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """خلط ترتيب الأسئلة عشوائياً."""
+    if not is_admin(update.effective_user.id, ctx.bot_data):
+        return
+    if ctx.user_data.get("sending"):
+        await update.message.reply_text("⚠️ لا يمكن الخلط أثناء الإرسال.")
+        return
+    questions = _ensure_question_objects(ctx.user_data.get("questions", []))
+    if len(questions) < 2:
+        await update.message.reply_text("⚠️ لا يوجد ما يكفي من الأسئلة للخلط.")
+        return
+    random.shuffle(questions)
+    ctx.user_data["questions"] = questions
+    await update.message.reply_text(
+        f"🔀 تم خلط *{len(questions)}* سؤال عشوائياً.", parse_mode="Markdown"
+    )
+
+
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     if ctx.user_data.get("sending"):
         await update.message.reply_text("⚠️ هناك عملية إرسال جارية بالفعل.")
         return
-    questions = ctx.user_data.get("questions", [])
+    questions = _ensure_question_objects(ctx.user_data.get("questions", []))
     last_sent = ctx.user_data.get("last_sent", 0)
     target    = ctx.user_data.get("send_target")
     if not questions or not target:
         await update.message.reply_text("⚠️ لا توجد عملية سابقة لاستئنافها.")
         return
     if last_sent >= len(questions):
-        await update.message.reply_text("✅ تم إرسال كل الأسئلة، لا شيء لاستئنافه.")
+        await update.message.reply_text("✅ كل الأسئلة أُرسلت سابقاً.")
         return
 
     chat_id = update.effective_chat.id
-    lock = get_send_lock(chat_id)
+    lock    = get_send_lock(chat_id)
     if lock.locked():
-        await update.message.reply_text("⚠️ عملية إرسال جارية بالفعل.")
+        await update.message.reply_text("⚠️ عملية إرسال جارية.")
         return
 
     async with lock:
         ctx.bot_data.setdefault("cancel_flags", {})[chat_id] = False
         ctx.user_data["sending"] = True
         msg = await update.message.reply_text(
-            f"🔄 استئناف من السؤال *{last_sent + 1}*...", parse_mode="Markdown"
+            f"🔄 استئناف من السؤال *{last_sent + 1}*…", parse_mode="Markdown"
         )
-        q_objs = _ensure_question_objects(questions)
         try:
             success, failed = await send_polls(
-                ctx.bot, target, q_objs, ctx,
+                ctx.bot, target, questions, ctx,
                 progress_msg=msg, start_index=last_sent, control_chat_id=chat_id,
             )
             ctx.user_data["last_failed"] = failed
             _update_stats(ctx, chat_id, success, len(failed))
-            await msg.reply_text(f"✅ تم الإرسال: {success}\n❌ فشل: {len(failed)}")
+            await msg.reply_text(f"✅ تم الإرسال: *{success}*\n❌ فشل: *{len(failed)}*", parse_mode="Markdown")
             await send_failed_file(ctx.bot, chat_id, failed)
         finally:
             ctx.user_data["sending"] = False
+            cleanup_lock(chat_id)
 
 
 async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     if ctx.user_data.get("sending"):
-        await update.message.reply_text("⚠️ هناك عملية إرسال جارية بالفعل.")
+        await update.message.reply_text("⚠️ هناك عملية إرسال جارية.")
         return
-    questions = ctx.user_data.get("questions", [])
+    questions = _ensure_question_objects(ctx.user_data.get("questions", []))
     if not questions:
         await update.message.reply_text(
             "⚠️ لا توجد أسئلة حالياً.\nأرسل نصاً أو ملفاً، أو استخدم /sendsaved."
         )
         return
-    img_c = sum(1 for q in questions if (q.get("image") if isinstance(q, dict) else q.image))
+    img_c = sum(1 for q in questions if q.image)
     await update.message.reply_text(
-        f"📤 لديك *{len(questions)}* سؤال جاهز\n"
-        f"_(نصية: {len(questions) - img_c} | مصوّرة: {img_c})_\n\n"
+        f"📤 لديك *{len(questions)}* سؤال\n"
+        f"_(نصية: {len(questions)-img_c} | مصوّرة: {img_c})_\n\n"
         "📍 أين تريد الإرسال؟",
-        reply_markup = dest_keyboard("dest"),
-        parse_mode   = "Markdown",
+        reply_markup=dest_keyboard("dest"),
+        parse_mode="Markdown",
     )
 
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     if ctx.user_data.get("sending"):
-        await update.message.reply_text("⚠️ لا يمكن المسح أثناء الإرسال. استخدم /cancel أولاً.")
+        await update.message.reply_text("⚠️ لا يمكن المسح أثناء الإرسال. استخدم /cancel.")
         return
     count = len(ctx.user_data.get("questions", []))
     if count == 0:
@@ -1135,16 +1226,13 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_delay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """ضبط التأخير بين الأسئلة: /delay 1.5"""
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
-    global SEND_DELAY
     args = ctx.args
     if not args:
-        current = ctx.user_data.get("send_delay", SEND_DELAY)
+        current = ctx.user_data.get("send_delay", DEFAULT_SEND_DELAY)
         await update.message.reply_text(
-            f"⏱ التأخير الحالي: *{current}s*\n\n"
-            "لتغييره: `/delay 1.5` (بين 0.3 و 10 ثوانٍ)",
+            f"⏱ التأخير الحالي: *{current}s*\n\nلتغييره: `/delay 1.5`\n(المدى: 0.3 – 10 ثانية)",
             parse_mode="Markdown",
         )
         return
@@ -1153,21 +1241,18 @@ async def cmd_delay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not 0.3 <= val <= 10:
             raise ValueError
         ctx.user_data["send_delay"] = val
-        SEND_DELAY = val
         await update.message.reply_text(f"✅ تم ضبط التأخير على *{val}s*", parse_mode="Markdown")
     except ValueError:
         await update.message.reply_text("⚠️ قيمة غير صالحة. مثال: `/delay 1.0`", parse_mode="Markdown")
 
 
 async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """إرسال سؤال اختبار للتحقق من عمل البوت."""
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
-    chat_id = update.effective_chat.id
     try:
         await ctx.bot.send_poll(
-            chat_id           = chat_id,
-            question          = "🧪 هذا سؤال اختبار — البوت يعمل بشكل صحيح!",
+            chat_id           = update.effective_chat.id,
+            question          = "🧪 سؤال اختبار — البوت يعمل بشكل صحيح!",
             options           = ["✅ الإجابة الصحيحة", "❌ خاطئة", "❌ خاطئة", CHANNEL_LABEL],
             type              = "quiz",
             correct_option_id = 0,
@@ -1182,24 +1267,25 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  أوامر المحفوظات
 # ═══════════════════════════════════════════════════════════════════════════
 async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     chat_id = update.effective_chat.id
-    saved   = ctx.bot_data.get("saved_questions", {}).get(chat_id, [])
+    saved   = _ensure_question_objects(
+        ctx.bot_data.get("saved_questions", {}).get(chat_id, [])
+    )
     if not saved:
         await update.message.reply_text("📭 المحفوظات فارغة حالياً.")
         return
-    img_c   = sum(1 for q in saved if (q.get("image") if isinstance(q, dict) else q.image))
+    img_c   = sum(1 for q in saved if q.image)
     preview = []
     for i, q in enumerate(saved[:5], 1):
-        qd   = q if isinstance(q, dict) else q.to_dict()
-        icon = "🖼" if qd.get("image") else "📝"
-        txt  = qd["question"][:60] + ("…" if len(qd["question"]) > 60 else "")
+        icon = "🖼" if q.image else "📝"
+        txt  = q.question[:60] + ("…" if len(q.question) > 60 else "")
         preview.append(f"{i}. {icon} {txt}")
     more = f"\n_…و {len(saved) - 5} سؤال آخر_" if len(saved) > 5 else ""
     await update.message.reply_text(
         f"📥 *المحفوظات:* {len(saved)} سؤال\n"
-        f"_(نصية: {len(saved) - img_c} | مصوّرة: {img_c})_\n\n"
+        f"_(نصية: {len(saved)-img_c} | مصوّرة: {img_c})_\n\n"
         + "\n".join(preview) + more
         + "\n\nاستخدم /sendsaved للإرسال أو /clearsaved للمسح.",
         parse_mode="Markdown",
@@ -1207,28 +1293,30 @@ async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_sendsaved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     if ctx.user_data.get("sending"):
         await update.message.reply_text("⚠️ هناك عملية إرسال جارية.")
         return
     chat_id = update.effective_chat.id
-    saved   = ctx.bot_data.get("saved_questions", {}).get(chat_id, [])
+    saved   = _ensure_question_objects(
+        ctx.bot_data.get("saved_questions", {}).get(chat_id, [])
+    )
     if not saved:
         await update.message.reply_text("📭 المحفوظات فارغة.")
         return
-    img_c = sum(1 for q in saved if (q.get("image") if isinstance(q, dict) else q.image))
+    img_c = sum(1 for q in saved if q.image)
     await update.message.reply_text(
         f"📤 إرسال *{len(saved)}* سؤال من المحفوظات\n"
-        f"_(نصية: {len(saved) - img_c} | مصوّرة: {img_c})_\n\n"
+        f"_(نصية: {len(saved)-img_c} | مصوّرة: {img_c})_\n\n"
         "📍 أين تريد الإرسال؟",
-        reply_markup = dest_keyboard("saved_dest"),
-        parse_mode   = "Markdown",
+        reply_markup=dest_keyboard("saved_dest"),
+        parse_mode="Markdown",
     )
 
 
 async def cmd_clearsaved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     if ctx.user_data.get("sending"):
         await update.message.reply_text("⚠️ لا يمكن المسح أثناء الإرسال.")
@@ -1237,20 +1325,18 @@ async def cmd_clearsaved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     saved   = ctx.bot_data.setdefault("saved_questions", {})
     count   = len(saved.get(chat_id, []))
     if count == 0:
-        await update.message.reply_text("📭 المحفوظات فارغة بالفعل.")
+        await update.message.reply_text("📭 المحفوظات فارغة.")
         return
     saved[chat_id] = []
     await update.message.reply_text(f"🗑 تم مسح *{count}* سؤال من المحفوظات.", parse_mode="Markdown")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  معالجة النص والملفات
+#  معالجة النصوص والملفات
 # ═══════════════════════════════════════════════════════════════════════════
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
-
-    # أولوية: هل الرسالة خيارات لصورة معلّقة؟
     if await handle_text_after_image(update, ctx):
         return
 
@@ -1288,7 +1374,7 @@ def _merge_chunks(chunks: list[str]) -> str:
 
 
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
     doc      = update.message.document
     filename = doc.file_name or "file.txt"
@@ -1311,7 +1397,6 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await prog.edit_text(f"⚠️ تعذّر قراءة الملف: {e}")
         return
-
     await prog.delete()
     await _process(update, ctx, text)
 
@@ -1321,19 +1406,17 @@ async def _process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     if not questions:
         await update.message.reply_text(
             "⚠️ لم أجد أسئلة في النص.\n\n"
-            "تأكد من الصيغة:\n"
-            "```\n1. نص السؤال\nA. خيار 1\nB. خيار 2\nAnswer: A\n```",
+            "مثال على الصيغة الصحيحة:\n"
+            "```\n1. نص السؤال\nA. خيار 1\nB. خيار 2\nC. خيار 3\nAnswer: A\n```",
             parse_mode="Markdown",
         )
         return
 
-    existing: list = ctx.user_data.get("questions", [])
-
-    # حد أقصى للقائمة
+    existing = _ensure_question_objects(ctx.user_data.get("questions", []))
     remaining = MAX_QUESTIONS - len(existing)
     if remaining <= 0:
         await update.message.reply_text(
-            f"⚠️ وصلت للحد الأقصى ({MAX_QUESTIONS} سؤال). استخدم /send أو /clear أولاً."
+            f"⚠️ وصلت للحد الأقصى ({MAX_QUESTIONS} سؤال). استخدم /send أو /clear."
         )
         return
     if len(questions) > remaining:
@@ -1361,18 +1444,62 @@ async def _process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     })
     await update.message.reply_text(
         f"✅ تم استخراج *{len(questions)}* سؤال\n\n📤 أين تريد الإرسال؟",
-        reply_markup = dest_keyboard("dest"),
-        parse_mode   = "Markdown",
+        reply_markup=dest_keyboard("dest"),
+        parse_mode="Markdown",
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  معالجة الأزرار
 # ═══════════════════════════════════════════════════════════════════════════
+async def _do_send(
+    bot, chat_id, control_chat_id, questions, ctx,
+    progress_msg, label: str,
+):
+    """دالة مساعدة مشتركة لإرسال الأسئلة."""
+    lock = get_send_lock(control_chat_id)
+    if lock.locked():
+        return False
+
+    q_objs  = _ensure_question_objects(questions)
+    img_c   = sum(1 for q in q_objs if q.image)
+    ctx.user_data.update({
+        "send_target": chat_id,
+        "last_sent":   0,
+        "sending":     True,
+    })
+    ctx.bot_data.setdefault("cancel_flags", {})[control_chat_id] = False
+    try:
+        await progress_msg.edit_text(
+            f"🚀 {label} (0/{len(q_objs)})…\n"
+            f"📝 نصية: {len(q_objs)-img_c} | 🖼 مصوّرة: {img_c}"
+        )
+    except TelegramError:
+        pass
+
+    async with lock:
+        try:
+            success, failed = await send_polls(
+                bot, chat_id, q_objs, ctx,
+                progress_msg=progress_msg, control_chat_id=control_chat_id,
+            )
+            ctx.user_data["last_failed"] = failed
+            _update_stats(ctx, control_chat_id, success, len(failed))
+            await progress_msg.reply_text(
+                f"✅ تم الإرسال: *{success}*\n❌ فشل: *{len(failed)}*",
+                parse_mode="Markdown",
+            )
+            await send_failed_file(bot, control_chat_id, failed)
+            return failed
+        finally:
+            ctx.user_data["sending"] = False
+            cleanup_lock(control_chat_id)
+
+
 async def handle_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
 
     action = query.data.split(":", 1)[1]
@@ -1391,24 +1518,19 @@ async def handle_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cur     = saved.get(chat_id, [])
         if len(cur) + len(questions) > MAX_SAVED:
             await query.edit_message_text(
-                f"⚠️ المحفوظات ممتلئة ({MAX_SAVED} سؤال كحد أقصى). استخدم /clearsaved أولاً."
+                f"⚠️ المحفوظات ممتلئة ({MAX_SAVED} حد أقصى). استخدم /clearsaved أولاً."
             )
             return
         saved.setdefault(chat_id, []).extend(questions)
         total = len(saved[chat_id])
-        ctx.user_data.update({
-            "questions": [], "last_sent": 0,
-            "last_failed": [], "send_target": None,
-        })
+        ctx.user_data.update({"questions": [], "last_sent": 0, "last_failed": [], "send_target": None})
         await query.edit_message_text(
-            f"📥 تم حفظ *{len(questions)}* سؤال!\n"
-            f"إجمالي المحفوظات: *{total}* سؤال\n\n"
+            f"📥 تم حفظ *{len(questions)}* سؤال! الإجمالي: *{total}*\n\n"
             "استخدم /sendsaved للإرسال لاحقاً.",
             parse_mode="Markdown",
         )
         return
 
-    # ── إرسال مباشر ──
     if ctx.user_data.get("sending"):
         await query.message.reply_text("⚠️ هناك عملية إرسال جارية.")
         return
@@ -1418,51 +1540,19 @@ async def handle_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ انتهت الجلسة، أرسل الأسئلة مجدداً.")
         return
 
-    chat_id         = query.message.chat_id if action == "SAME_CHAT" else action
+    dest            = query.message.chat_id if action == "SAME_CHAT" else action
     control_chat_id = query.message.chat_id
 
-    lock = get_send_lock(control_chat_id)
-    if lock.locked():
-        await query.message.reply_text("⚠️ عملية إرسال جارية.")
-        return
-
-    ctx.user_data.update({
-        "send_target": chat_id,
-        "last_sent":   0,
-        "sending":     True,
-    })
-    q_objs  = _ensure_question_objects(questions)
-    img_c   = sum(1 for q in q_objs if q.image)
-    await query.edit_message_text(
-        f"🚀 جاري الإرسال (0/{len(q_objs)})…\n"
-        f"📝 نصية: {len(q_objs) - img_c} | 🖼 مصوّرة: {img_c}"
-    )
-
-    async with lock:
-        try:
-            success, failed = await send_polls(
-                ctx.bot, chat_id, q_objs, ctx,
-                progress_msg=query.message, control_chat_id=control_chat_id,
-            )
-            ctx.user_data["last_failed"] = failed
-            _update_stats(ctx, control_chat_id, success, len(failed))
-            await query.message.reply_text(
-                f"✅ تم الإرسال: *{success}*\n❌ فشل: *{len(failed)}*",
-                parse_mode="Markdown",
-            )
-            await send_failed_file(ctx.bot, control_chat_id, failed)
-        finally:
-            ctx.user_data["sending"] = False
+    await _do_send(ctx.bot, dest, control_chat_id, questions, ctx, query.message, "جاري الإرسال")
 
 
 async def handle_saved_destination(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(update.effective_user.id):
+    if not is_admin(update.effective_user.id, ctx.bot_data):
         return
 
     action = query.data.split(":", 1)[1]
-
     if action == "CANCEL":
         await query.edit_message_text("🚫 تم الإلغاء.")
         return
@@ -1471,89 +1561,49 @@ async def handle_saved_destination(update: Update, ctx: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("⚠️ هناك عملية إرسال جارية.")
         return
 
-    chat_id         = query.message.chat_id
-    saved           = ctx.bot_data.get("saved_questions", {}).get(chat_id, [])
+    chat_id = query.message.chat_id
+    saved   = ctx.bot_data.get("saved_questions", {}).get(chat_id, [])
     if not saved:
         await query.edit_message_text("📭 المحفوظات فارغة.")
         return
 
-    dest            = chat_id if action == "SAME_CHAT" else action
-    control_chat_id = chat_id
+    dest = chat_id if action == "SAME_CHAT" else action
+    ctx.user_data.update({"questions": list(saved), "last_sent": 0, "last_failed": []})
 
-    lock = get_send_lock(control_chat_id)
-    if lock.locked():
-        await query.message.reply_text("⚠️ عملية إرسال جارية.")
-        return
+    failed = await _do_send(ctx.bot, dest, chat_id, saved, ctx, query.message, "جاري إرسال المحفوظات")
 
-    q_objs = _ensure_question_objects(list(saved))
-    ctx.user_data.update({
-        "questions":   q_objs,
-        "last_sent":   0,
-        "last_failed": [],
-        "sending":     True,
-        "send_target": dest,
-    })
-    ctx.bot_data.setdefault("cancel_flags", {})[control_chat_id] = False
-
-    img_c = sum(1 for q in q_objs if q.image)
-    await query.edit_message_text(
-        f"🚀 جاري إرسال المحفوظات (0/{len(q_objs)})…\n"
-        f"📝 نصية: {len(q_objs) - img_c} | 🖼 مصوّرة: {img_c}"
-    )
-
-    async with lock:
-        try:
-            success, failed = await send_polls(
-                ctx.bot, dest, q_objs, ctx,
-                progress_msg=query.message, control_chat_id=control_chat_id,
-            )
-            ctx.user_data["last_failed"] = failed
-            _update_stats(ctx, chat_id, success, len(failed))
-
-            if not failed:
-                ctx.bot_data["saved_questions"][chat_id] = []
-                note = "\n🗑 تم مسح المحفوظات تلقائياً بعد الإرسال الكامل."
-            else:
-                failed_indices = {f["index"] - 1 for f in failed}
-                ctx.bot_data["saved_questions"][chat_id] = [
-                    q for idx, q in enumerate(q_objs) if idx in failed_indices
-                ]
-                note = f"\n⚠️ تم الاحتفاظ بـ {len(failed)} سؤال فاشل في المحفوظات."
-
-            await query.message.reply_text(
-                f"✅ تم الإرسال: *{success}*\n❌ فشل: *{len(failed)}*" + note,
-                parse_mode="Markdown",
-            )
-            await send_failed_file(ctx.bot, control_chat_id, failed)
-        finally:
-            ctx.user_data["sending"] = False
-
-
-async def handle_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """معالجة أزرار التأكيد (confirm:action:yes/no)."""
-    query = update.callback_query
-    await query.answer()
-    _, action, choice = query.data.split(":", 2)
-    if choice == "no":
-        await query.edit_message_text("🚫 تم الإلغاء.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  أدوات مساعدة داخلية
-# ═══════════════════════════════════════════════════════════════════════════
-def _ensure_question_objects(qs: list) -> list[Question]:
-    """تحويل dicts قديمة إلى Question objects إذا لزم."""
-    result = []
-    for q in qs:
-        if isinstance(q, Question):
-            result.append(q)
-        elif isinstance(q, dict):
-            result.append(Question.from_dict(q))
+    if failed is not None:
+        if not failed:
+            ctx.bot_data["saved_questions"][chat_id] = []
+            await query.message.reply_text("🗑 تم مسح المحفوظات تلقائياً بعد الإرسال الكامل.")
         else:
-            logger.warning("نوع سؤال غير معروف: %s", type(q))
-    return result
+            failed_idxs = {f["index"] - 1 for f in failed}
+            q_objs = _ensure_question_objects(saved)
+            ctx.bot_data["saved_questions"][chat_id] = [
+                q for idx, q in enumerate(q_objs) if idx in failed_idxs
+            ]
+            await query.message.reply_text(
+                f"⚠️ تم الاحتفاظ بـ {len(failed)} سؤال فاشل في المحفوظات."
+            )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Error Handler العالمي
+# ═══════════════════════════════════════════════════════════════════════════
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.exception("خطأ غير معالَج: %s", ctx.error, exc_info=ctx.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ حدث خطأ غير متوقع. يرجى المحاولة مجدداً أو استخدام /cancel."
+            )
+        except TelegramError:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  أدوات داخلية
+# ═══════════════════════════════════════════════════════════════════════════
 def _update_stats(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, success: int, failed: int):
     stats = ctx.bot_data.setdefault("session_stats", {})
     s     = stats.setdefault(chat_id, {"total_sent": 0, "total_failed": 0, "sessions": 0})
@@ -1566,39 +1616,52 @@ def _update_stats(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, success: int, fa
 #  main
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
 
-    # أوامر
-    for cmd, fn in [
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .persistence(persistence)
+        .rate_limiter(AIORateLimiter(max_retries=3))
+        .build()
+    )
+
+    # ── أوامر ─────────────────────────────────────────────────────────────
+    commands = [
         ("start",      cmd_start),
-        ("help",       cmd_start),
+        ("help",       cmd_help),
         ("cancel",     cmd_cancel),
         ("status",     cmd_status),
         ("stats",      cmd_stats),
         ("resume",     cmd_resume),
         ("myid",       cmd_myid),
+        ("addadmin",   cmd_addadmin),
         ("send",       cmd_send),
         ("clear",      cmd_clear),
         ("preview",    cmd_preview),
+        ("shuffle",    cmd_shuffle),
         ("saved",      cmd_saved),
         ("sendsaved",  cmd_sendsaved),
         ("clearsaved", cmd_clearsaved),
         ("delay",      cmd_delay),
         ("test",       cmd_test),
-    ]:
+    ]
+    for cmd, fn in commands:
         app.add_handler(CommandHandler(cmd, fn))
 
-    # رسائل
+    # ── رسائل ─────────────────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.Document.ALL,            handle_file))
 
-    # أزرار
+    # ── أزرار ──────────────────────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(handle_destination,       pattern=r"^dest:"))
     app.add_handler(CallbackQueryHandler(handle_saved_destination, pattern=r"^saved_dest:"))
-    app.add_handler(CallbackQueryHandler(handle_confirm,           pattern=r"^confirm:"))
 
-    logger.info("✅ البوت يعمل — جاهز للاستقبال...")
+    # ── Error Handler ──────────────────────────────────────────────────────
+    app.add_error_handler(error_handler)
+
+    logger.info("✅ البوت يعمل — AIORateLimiter + PicklePersistence نشطان")
     app.run_polling(drop_pending_updates=True)
 
 
