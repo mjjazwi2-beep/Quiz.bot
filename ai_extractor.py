@@ -72,7 +72,7 @@ async def ask_claude(messages: list, use_pdf_beta: bool = False) -> str:
         headers["anthropic-beta"] = "pdfs-2024-09-25"
 
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-4-5",
         "max_tokens": 8000,
         "messages": messages,
     }
@@ -88,7 +88,7 @@ async def ask_claude(messages: list, use_pdf_beta: bool = False) -> str:
             )
             logger.info("استجابة Claude: %d", resp.status_code)
             if resp.status_code != 200:
-                logger.error("خطأ Claude: %s", resp.text)
+                logger.error("خطأ Claude كامل: %s", resp.text)
                 resp.raise_for_status()
             result = resp.json()["content"][0]["text"]
             logger.info("Claude أعاد %d حرف", len(result))
@@ -97,8 +97,8 @@ async def ask_claude(messages: list, use_pdf_beta: bool = False) -> str:
         logger.error("انتهت مهلة الاتصال بـ Claude")
         raise RuntimeError("انتهت مهلة Claude (180 ثانية) — حاول مجدداً")
     except httpx.HTTPStatusError as e:
-        logger.error("HTTP Error من Claude: %s", e)
-        raise RuntimeError(f"خطأ من Claude API: {e.response.status_code}")
+        logger.error("HTTP Error من Claude: %s", e.response.text)
+        raise RuntimeError(f"خطأ من Claude API: {e.response.status_code} — {e.response.text[:300]}")
 
 
 async def ask_claude_with_text(text: str) -> str:
@@ -175,13 +175,11 @@ async def smart_extract_mcq(filename: str, data: bytes) -> str:
         "webp": "image/webp",
     }
 
-    # صورة
     if ext in image_types:
         img_b64 = base64.standard_b64encode(data).decode("utf-8")
         logger.info("صورة — إرسال لـ Claude Vision")
         return await ask_claude_with_image(img_b64, image_types[ext])
 
-    # PDF
     if ext == "pdf":
         text = await extract_text_from_pdf(data)
         if text:
@@ -190,7 +188,6 @@ async def smart_extract_mcq(filename: str, data: bytes) -> str:
         logger.info("PDF ممسوح — إرسال مباشر لـ Claude")
         return await ask_claude_with_pdf_bytes(data)
 
-    # نص عادي
     for enc in ("utf-8", "utf-8-sig", "cp1256", "latin-1"):
         try:
             text = data.decode(enc)
