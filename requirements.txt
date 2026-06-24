@@ -1,6 +1,0 @@
-python-telegram-bot[job-queue]==21.3
-httpx
-pdfplumber
-PyPDF2
-python-docx
-PyMuPDF
