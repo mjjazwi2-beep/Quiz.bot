@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.so
+
+# البيانات المحلية (لا ترفعها للـ repo)
+bot_data.pkl
+*.pkl
+.env
+
+# بيئات Python الافتراضية
+venv/
+env/
+.venv/
+.env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# نظام التشغيل
+.DS_Store
+Thumbs.db
+
+# سجلات
+*.log
+logs/
