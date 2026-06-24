@@ -1376,30 +1376,57 @@ def _merge_chunks(chunks: list[str]) -> str:
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, ctx.bot_data):
         return
+
     doc      = update.message.document
     filename = doc.file_name or "file.txt"
     ext      = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
 
-    if ext not in ("txt", "docx", "pdf"):
+    allowed = ("txt", "docx", "pdf", "jpg", "jpeg", "png", "webp")
+    if ext not in allowed:
         await update.message.reply_text(
-            "⚠️ الصيغ المدعومة: `txt` · `docx` · `pdf`", parse_mode="Markdown"
+            "⚠️ الصيغ المدعومة: `txt · docx · pdf · jpg · png`",
+            parse_mode="Markdown"
         )
         return
+
     if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         await update.message.reply_text("⚠️ حجم الملف يتجاوز 20MB.")
         return
 
-    prog = await update.message.reply_text("⏳ جارٍ قراءة الملف…")
+    # ملفات نصية وdocx — المعالجة العادية بدون AI
+    if ext in ("txt", "docx"):
+        prog = await update.message.reply_text("⏳ جارٍ قراءة الملف…")
+        try:
+            tg_file = await doc.get_file()
+            data    = bytes(await tg_file.download_as_bytearray())
+            text    = extract_text_from_file(filename, data)
+        except Exception as e:
+            await prog.edit_text(f"⚠️ تعذّر قراءة الملف: {e}")
+            return
+        await prog.delete()
+        await _process(update, ctx, text)
+        return
+
+    # PDF وصور — معالجة بالذكاء الاصطناعي
+    prog = await update.message.reply_text(
+        "🧠 *جارٍ تحليل الملف بالذكاء الاصطناعي…*\n"
+        "قد يستغرق 20-40 ثانية ⏳",
+        parse_mode="Markdown"
+    )
     try:
         tg_file = await doc.get_file()
         data    = bytes(await tg_file.download_as_bytearray())
-        text    = extract_text_from_file(filename, data)
+
+        from ai_extractor import smart_extract_mcq
+        text = await smart_extract_mcq(filename, data)
+
     except Exception as e:
-        await prog.edit_text(f"⚠️ تعذّر قراءة الملف: {e}")
+        logger.exception("خطأ في معالجة الملف بالذكاء الاصطناعي")
+        await prog.edit_text(f"⚠️ تعذّر معالجة الملف: {e}")
         return
+
     await prog.delete()
     await _process(update, ctx, text)
-
 
 async def _process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     questions = extract_questions(text)
