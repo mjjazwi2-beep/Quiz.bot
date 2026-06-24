@@ -2,6 +2,7 @@ import io
 import base64
 import logging
 import os
+import asyncio
 
 import httpx
 
@@ -9,46 +10,78 @@ logger = logging.getLogger("AIExtractor")
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+# نجرب النموذجين — إذا فشل الأول ننتقل للثاني
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+]
 
-MCQ_PROMPT = """أنت خبير متخصص في استخراج أسئلة الاختيار من متعدد (MCQ) من أي مصدر بدقة مطلقة.
+MCQ_PROMPT = """You are a world-class MCQ extraction expert specialized in medical education content.
 
-=== مهمتك ===
-استخرج كل سؤال مع خياراته وحدد الإجابة الصحيحة بدقة 100%.
+Your ONLY job: extract every single question with its options and identify the correct answer with 100% accuracy.
 
-=== كيف تحدد الإجابة الصحيحة ===
-ابحث عن أي من هذه الإشارات البصرية أو النصية:
-- تظليل أو لون مختلف على الخيار (أصفر، أخضر، رمادي، إلخ)
-- خط تحت الخيار أو خط فوقه
-- علامة ✓ أو * أو ** أو → بجانب الخيار
-- خط شطب على الخيارات الخاطئة
-- كلمات مثل: Answer / Ans / Correct / الإجابة / الجواب بعدها حرف أو نص
-- الخيار المكتوب بخط غامق (Bold) بينما الباقي عادي
-- أي إشارة بصرية أخرى تميز خياراً عن غيره
-إذا لم تجد أي إشارة، استخدم معرفتك العلمية لتحديد الإجابة الصحيحة.
+=== HOW TO DETECT THE CORRECT ANSWER ===
+Look for ANY of these signals — visual or textual:
 
-=== قواعد الاستخراج ===
-- انسخ نص كل سؤال حرفياً كما هو بدون أي تعديل
-- انسخ كل خيار حرفياً كما هو بدون أي تعديل
-- لا تضف ولا تحذف ولا تصحح أي كلمة
-- حافظ على ترتيب الخيارات الأصلي تماماً
-- استخرج كل الأسئلة حتى لو كانت بلغات مختلفة
+VISUAL signals (in images/PDFs):
+- Highlighted or colored option (yellow, green, blue, any color)
+- Bold or underlined option
+- Checkmark ✓ or tick mark next to an option
+- Arrow → or asterisk * pointing to an option
+- Filled bubble/circle ● in bubble sheets (vs empty ○)
+- Strikethrough on WRONG options (correct = the one NOT crossed)
+- Any mark, dot, star, or symbol near an option
+- Handwritten circle or mark on an answer sheet
 
-=== تنسيق الإخراج الإلزامي ===
-Q1. [نص السؤال كاملاً حرفياً]
-A. [الخيار أ حرفياً]
-B. [الخيار ب حرفياً]
-C. [الخيار ج حرفياً]
-D. [الخيار د حرفياً]
-Answer: [الحرف الصحيح فقط]
+TEXTUAL signals:
+- Answer: X / Ans: X / Correct: X / Key: X
+- The letter alone on a line after options (A / B / C / D)
+- Answer written at end of question or in a separate answer key section
 
-Q2. [نص السؤال كاملاً حرفياً]
-...وهكذا
+IF NO SIGNAL EXISTS:
+- Use your medical knowledge to determine the correct answer
+- Choose the most scientifically accurate option
 
-=== ممنوع تماماً ===
-- لا تضف أي عناوين أو ملاحظات أو تعليقات
-- لا تكتب أي شيء قبل Q1 أو بعد آخر سؤال
-- لا تستخدم markdown أو **bold** أو أي تنسيق إضافي"""
+=== EXTRACTION RULES ===
+- Copy question text EXACTLY — zero modifications, zero corrections
+- Copy every option EXACTLY as written — spelling errors included
+- Preserve original option order (A B C D or 1 2 3 4 or any format)
+- Extract ALL questions even if format varies between them
+- Handle any number of options (2, 3, 4, 5, or more)
+- If a question has a clinical vignette/case — include the FULL case text
+- If options span multiple lines — combine them correctly
+
+=== HANDLE ANY FORMAT ===
+✅ Numbered: 1. 2. 3. / Q1. Q2. Q3.
+✅ Lettered options: A. B. C. D. / A) B) C) D) / (A) (B) (C) (D)
+✅ Bubble sheets: detect filled bubbles
+✅ Tables or columns: read left-to-right, top-to-bottom
+✅ Mixed formats in same document
+✅ Scanned handwritten exams
+✅ Screenshots of question banks (Amboss, UWorld, Anki, etc.)
+✅ Answer keys at end of document — match them to questions
+✅ True/False questions → options are: True / False
+✅ Questions with images described in text
+
+=== OUTPUT FORMAT — STRICTLY FOLLOW THIS ===
+Q1. [full question text exactly as written]
+A. [option text exactly]
+B. [option text exactly]
+C. [option text exactly]
+D. [option text exactly]
+Answer: [correct letter only — A or B or C or D]
+
+Q2. [full question text exactly as written]
+A. [option text exactly]
+...
+Answer: [correct letter]
+
+=== ABSOLUTE RULES ===
+- Output NOTHING before Q1
+- Output NOTHING after the last answer
+- No comments, no notes, no explanations, no markdown
+- No "Here are the questions:" or any intro text
+- If you cannot find ANY questions, output only: NO_QUESTIONS_FOUND"""
 
 
 async def extract_text_from_pdf(data: bytes) -> str:
@@ -58,10 +91,10 @@ async def extract_text_from_pdf(data: bytes) -> str:
             pages = [p.extract_text() or "" for p in pdf.pages]
             text = "\n".join(pages)
             if len(text.strip()) > 50:
-                logger.info("pdfplumber نجح — %d حرف", len(text))
+                logger.info("pdfplumber succeeded — %d chars", len(text))
                 return text
     except Exception as e:
-        logger.warning("pdfplumber فشل: %s", e)
+        logger.warning("pdfplumber failed: %s", e)
 
     try:
         from PyPDF2 import PdfReader
@@ -69,59 +102,86 @@ async def extract_text_from_pdf(data: bytes) -> str:
         pages = [page.extract_text() or "" for page in reader.pages]
         text = "\n".join(pages)
         if len(text.strip()) > 50:
-            logger.info("PyPDF2 نجح — %d حرف", len(text))
+            logger.info("PyPDF2 succeeded — %d chars", len(text))
             return text
     except Exception as e:
-        logger.warning("PyPDF2 فشل: %s", e)
+        logger.warning("PyPDF2 failed: %s", e)
 
     return ""
 
 
 async def ask_gemini(contents: list) -> str:
     if not GEMINI_KEY:
-        raise ValueError("GEMINI_API_KEY غير موجود في المتغيرات البيئية!")
+        raise ValueError("GEMINI_API_KEY is not set!")
 
     payload = {
         "contents": contents,
         "generationConfig": {
             "maxOutputTokens": 8000,
-            "temperature": 0.1,
+            "temperature": 0.05,
         }
     }
 
-    logger.info("إرسال طلب لـ Gemini...")
+    last_error = None
 
-    try:
-        async with httpx.AsyncClient(timeout=180) as client:
-            resp = await client.post(
-                f"{GEMINI_URL}?key={GEMINI_KEY}",
-                json=payload,
-            )
-            logger.info("استجابة Gemini: %d", resp.status_code)
-            if resp.status_code != 200:
-                logger.error("خطأ Gemini كامل: %s", resp.text)
-                resp.raise_for_status()
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-            data = resp.json()
-            result = data["candidates"][0]["content"]["parts"][0]["text"]
-            logger.info("Gemini أعاد %d حرف", len(result))
-            return result
+        for attempt in range(3):  # 3 محاولات لكل نموذج
+            try:
+                logger.info("Trying model=%s attempt=%d", model, attempt + 1)
+                async with httpx.AsyncClient(timeout=180) as client:
+                    resp = await client.post(
+                        f"{url}?key={GEMINI_KEY}",
+                        json=payload,
+                    )
+                    logger.info("Gemini response: %d (model=%s)", resp.status_code, model)
 
-    except httpx.TimeoutException:
-        logger.error("انتهت مهلة الاتصال بـ Gemini")
-        raise RuntimeError("انتهت مهلة Gemini (180 ثانية) — حاول مجدداً")
-    except httpx.HTTPStatusError as e:
-        logger.error("HTTP Error من Gemini: %s", e.response.text)
-        raise RuntimeError(f"خطأ من Gemini API: {e.response.status_code} — {e.response.text[:300]}")
-    except (KeyError, IndexError) as e:
-        logger.error("خطأ في تحليل رد Gemini: %s", e)
-        raise RuntimeError("رد غير متوقع من Gemini")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        result = data["candidates"][0]["content"]["parts"][0]["text"]
+                        logger.info("Success — %d chars (model=%s)", len(result), model)
+                        return result
+
+                    if resp.status_code == 503:
+                        wait = 5 * (attempt + 1)
+                        logger.warning("503 overloaded — waiting %ds then retry", wait)
+                        await asyncio.sleep(wait)
+                        last_error = f"503 overloaded (model={model})"
+                        continue
+
+                    if resp.status_code == 429:
+                        wait = 10 * (attempt + 1)
+                        logger.warning("429 rate limit — waiting %ds", wait)
+                        await asyncio.sleep(wait)
+                        last_error = f"429 rate limit (model={model})"
+                        continue
+
+                    # أخطاء أخرى — سجل وانتقل للنموذج التالي
+                    logger.error("Gemini error %d: %s", resp.status_code, resp.text[:200])
+                    last_error = f"{resp.status_code}: {resp.text[:200]}"
+                    break
+
+            except httpx.TimeoutException:
+                logger.warning("Timeout on model=%s attempt=%d", model, attempt + 1)
+                last_error = f"Timeout (model={model})"
+                await asyncio.sleep(5)
+                continue
+
+            except Exception as e:
+                logger.error("Unexpected error: %s", e)
+                last_error = str(e)
+                break
+
+        logger.warning("Model %s failed — trying next model", model)
+
+    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 
 async def ask_gemini_with_text(text: str) -> str:
     if len(text) > 80000:
         text = text[:80000]
-        logger.warning("النص كبير — تم اقتطاعه إلى 80000 حرف")
+        logger.warning("Text too large — truncated to 80000 chars")
 
     contents = [{
         "role": "user",
@@ -148,7 +208,7 @@ async def ask_gemini_with_image(img_b64: str, media_type: str) -> str:
 
 async def ask_gemini_with_pdf(data: bytes) -> str:
     if len(data) > 20 * 1024 * 1024:
-        raise ValueError("ملف PDF كبير جداً (أكثر من 20MB)")
+        raise ValueError("PDF too large (max 20MB)")
 
     pdf_b64 = base64.standard_b64encode(data).decode("utf-8")
     contents = [{
@@ -169,11 +229,11 @@ async def ask_gemini_with_pdf(data: bytes) -> str:
 async def smart_extract_mcq(filename: str, data: bytes) -> str:
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "txt"
 
-    logger.info("▶ smart_extract_mcq — ملف: %s | نوع: %s | حجم: %d bytes",
+    logger.info("▶ smart_extract_mcq — file: %s | type: %s | size: %d bytes",
                 filename, ext, len(data))
 
     if not GEMINI_KEY:
-        raise ValueError("GEMINI_API_KEY غير مضبوط!")
+        raise ValueError("GEMINI_API_KEY is not configured!")
 
     image_types = {
         "jpg":  "image/jpeg",
@@ -182,26 +242,23 @@ async def smart_extract_mcq(filename: str, data: bytes) -> str:
         "webp": "image/webp",
     }
 
-    # صورة — يرسلها مباشرة لـ Gemini Vision ليرى التظليل والإشارات البصرية
     if ext in image_types:
         img_b64 = base64.standard_b64encode(data).decode("utf-8")
-        logger.info("صورة — إرسال لـ Gemini Vision")
+        logger.info("Image — sending to Gemini Vision")
         return await ask_gemini_with_image(img_b64, image_types[ext])
 
-    # PDF — يحاول النص أولاً، وإن فشل يرسله كصورة
     if ext == "pdf":
         text = await extract_text_from_pdf(data)
         if text:
-            logger.info("PDF نصي — إرسال النص لـ Gemini (%d حرف)", len(text))
+            logger.info("Text PDF — sending text to Gemini (%d chars)", len(text))
             return await ask_gemini_with_text(text)
-        logger.info("PDF ممسوح — إرسال مباشر لـ Gemini")
+        logger.info("Scanned PDF — sending directly to Gemini Vision")
         return await ask_gemini_with_pdf(data)
 
-    # نص عادي
     for enc in ("utf-8", "utf-8-sig", "cp1256", "latin-1"):
         try:
             text = data.decode(enc)
-            logger.info("ملف نصي (%s) — إرسال لـ Gemini", enc)
+            logger.info("Text file (%s) — sending to Gemini", enc)
             return await ask_gemini_with_text(text)
         except UnicodeDecodeError:
             continue
