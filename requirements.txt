@@ -1,5 +1,6 @@
-python-telegram-bot[rate-limiter]==21.6
-python-docx
-pdfplumber
+python-telegram-bot[job-queue]==21.3
 httpx
+pdfplumber
 PyPDF2
+python-docx
+PyMuPDF
