@@ -18,6 +18,9 @@
   ✅ شريط تقدم بنسبة مئوية أدق
   ✅ رسالة /help منفصلة وأوضح
   ✅ error handler عالمي مع logging
+  ✅ اسم القناة (الخيار الإضافي في كل سؤال) أصبح قابلاً للتغيير من داخل
+     البوت مباشرة عبر /label و /setlabel — بدون لمس الكود، لكل شات
+     على حدة، ويُحفظ تلقائياً عبر إعادة التشغيل (PicklePersistence)
 """
 
 from __future__ import annotations
@@ -94,7 +97,8 @@ def _parse_ids(*env_names: str) -> set[int]:
 # مجموعة الأدمن الأساسية من البيئة + الثابت
 _BASE_ADMIN_IDS: set[int] = _parse_ids("ADMIN_ID", "ADMIN_IDS") | {8693892771}
 
-CHANNEL_LABEL      = "𝐏𝐬𝐞𝐮𝐝𝐨𝐬𝐜𝐢𝐞𝐧𝐜𝐞"
+DEFAULT_CHANNEL_LABEL = "𝐏𝐬𝐞𝐮𝐝𝐨𝐬𝐜𝐢𝐞𝐧𝐜𝐞"
+LABEL_MAX_LEN      = 80  # حد آمن لطول اسم القناة كخيار داخل الاستطلاع
 MAIN_CHANNEL       = os.environ.get("MAIN_CHANNEL", "@mj515678")
 DEFAULT_SEND_DELAY = float(os.environ.get("SEND_DELAY",        "0.5"))
 BUFFER_DELAY       = float(os.environ.get("BUFFER_DELAY",      "2.0"))
@@ -125,6 +129,32 @@ def is_admin(user_id: int, bot_data: dict | None = None) -> bool:
     if bot_data is None:
         return user_id in _BASE_ADMIN_IDS
     return user_id in get_all_admins(bot_data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  إدارة "اسم القناة" الديناميكي (الخيار الإضافي في كل سؤال)
+# ═══════════════════════════════════════════════════════════════════════════
+def get_label_cfg(bot_data: dict, chat_id: int) -> dict:
+    """يُعيد إعدادات اسم القناة لهذا الشات (يُنشئها بالقيم الافتراضية إن لم توجد)."""
+    cfgs = bot_data.setdefault("channel_label_cfg", {})
+    return cfgs.setdefault(chat_id, {"enabled": True, "text": DEFAULT_CHANNEL_LABEL})
+
+
+def set_label_text(bot_data: dict, chat_id: int, text: str) -> str:
+    """يضبط اسم القناة الجديد لهذا الشات ويُفعّله تلقائياً، ويُعيد النص بعد التنظيف."""
+    text = text.strip()[:LABEL_MAX_LEN]
+    cfg = get_label_cfg(bot_data, chat_id)
+    cfg["text"] = text
+    cfg["enabled"] = True
+    return text
+
+
+def get_active_label(bot_data: dict, chat_id: int) -> str | None:
+    """يُعيد اسم القناة الحالي إن كانت الميزة مُفعّلة، أو None إن كانت مُعطّلة."""
+    cfg = get_label_cfg(bot_data, chat_id)
+    if not cfg.get("enabled", True):
+        return None
+    return (cfg.get("text") or DEFAULT_CHANNEL_LABEL)[:LABEL_MAX_LEN]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -690,8 +720,9 @@ async def send_polls(
 
         # ── تجهيز الخيارات ───────────────────────────────────────────────
         opts = [o[:MAX_OPT] for o in poll_options]
-        if len(opts) < TG_MAX_POLL_OPTS:
-            opts.append(CHANNEL_LABEL[:MAX_OPT])
+        channel_label = get_active_label(ctx.bot_data, control_chat_id)
+        if channel_label and len(opts) < TG_MAX_POLL_OPTS:
+            opts.append(channel_label[:MAX_OPT])
 
         # ── إرسال الاستطلاع مع retry ─────────────────────────────────────
         sent_ok = False
@@ -995,8 +1026,16 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/clear — مسح الأسئلة الحالية\n"
         "/delay [ث] — ضبط التأخير (0.3–10)\n"
         "/addadmin [ID] — إضافة أدمن مؤقت\n"
+        "/label — إدارة اسم القناة (عرض/تغيير/تعطيل)\n"
+        "/setlabel [اسم] — تغيير اسم القناة مباشرة\n"
         "/test — سؤال اختبار\n"
-        "/myid — معرفة آيديك",
+        "/myid — معرفة آيديك\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🏷 *اسم القناة (خيار إضافي تلقائي):*\n"
+        "كل سؤال يُرسل يحصل تلقائياً على خيار إضافي إجابته غير صحيحة "
+        "يحمل اسم قناتك، لأغراض الترويج. غيّره بسهولة:\n"
+        "`/setlabel اسم قناتك هنا`\n"
+        "أو استخدم /label لقائمة تفاعلية بها تعطيل/تفعيل وإرجاع الافتراضي.",
         parse_mode="Markdown",
     )
 
@@ -1030,6 +1069,108 @@ async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def label_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ إرسال اسم جديد", callback_data="label:CHANGE")],
+        [InlineKeyboardButton(
+            "🚫 تعطيل الخيار الإضافي" if enabled else "✅ تفعيل الخيار الإضافي",
+            callback_data="label:TOGGLE",
+        )],
+        [InlineKeyboardButton("♻️ إرجاع الاسم الافتراضي", callback_data="label:RESET")],
+    ])
+
+
+async def show_label_menu(message, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    cfg    = get_label_cfg(ctx.bot_data, chat_id)
+    status = "✅ مُفعّل" if cfg.get("enabled", True) else "🚫 مُعطّل"
+    await message.reply_text(
+        "🏷 *إدارة اسم القناة*\n\n"
+        f"الاسم الحالي: *{cfg.get('text') or DEFAULT_CHANNEL_LABEL}*\n"
+        f"الحالة: {status}\n\n"
+        "هذا الاسم يُضاف تلقائياً كخيار إضافي (غير صحيح) في نهاية كل سؤال يُرسل — "
+        "طريقة سهلة للترويج لقناتك داخل كل استطلاع.\n\n"
+        "📌 لتغييره مباشرة اكتب:\n`/setlabel اسمك هنا`\n"
+        "أو اضغط الزر أدناه ثم أرسل الاسم الجديد كرسالة عادية.",
+        reply_markup=label_menu_keyboard(cfg.get("enabled", True)),
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_label(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """يعرض قائمة تفاعلية لإدارة اسم القناة (عرض / تغيير / تعطيل / إرجاع الافتراضي)."""
+    if not is_admin(update.effective_user.id, ctx.bot_data):
+        return
+    await show_label_menu(update.message, ctx, update.effective_chat.id)
+
+
+async def cmd_setlabel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """يغيّر اسم القناة مباشرةً: /setlabel اسمك الجديد هنا"""
+    if not is_admin(update.effective_user.id, ctx.bot_data):
+        return
+    chat_id = update.effective_chat.id
+    ctx.user_data.pop("awaiting_label", None)
+
+    if not ctx.args:
+        await show_label_menu(update.message, ctx, chat_id)
+        return
+
+    text = " ".join(ctx.args).strip()
+    if not text:
+        await update.message.reply_text("⚠️ لا يمكن أن يكون الاسم فارغاً.")
+        return
+
+    saved = set_label_text(ctx.bot_data, chat_id, text)
+    await update.message.reply_text(
+        f"✅ تم تعيين اسم القناة إلى:\n*{saved}*\n\n"
+        "سيظهر هذا الآن كخيار إضافي تلقائياً في نهاية كل سؤال يتم إرساله من هذا الشات.",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_label_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id, ctx.bot_data):
+        return
+
+    action  = query.data.split(":", 1)[1]
+    chat_id = query.message.chat_id
+    cfg     = get_label_cfg(ctx.bot_data, chat_id)
+
+    if action == "CHANGE":
+        ctx.user_data["awaiting_label"] = True
+        await query.message.reply_text(
+            "✏️ أرسل الآن الاسم الجديد الذي تريد إضافته كخيار في كل سؤال:\n"
+            "_(أرسل /cancel لإلغاء العملية)_",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "TOGGLE":
+        cfg["enabled"] = not cfg.get("enabled", True)
+        try:
+            await query.edit_message_text(
+                f"{'✅ تم تفعيل' if cfg['enabled'] else '🚫 تم تعطيل'} الخيار الإضافي.\n\n"
+                f"الاسم المحفوظ حالياً: *{cfg.get('text') or DEFAULT_CHANNEL_LABEL}*",
+                parse_mode="Markdown",
+            )
+        except TelegramError:
+            pass
+        return
+
+    if action == "RESET":
+        cfg["text"]    = DEFAULT_CHANNEL_LABEL
+        cfg["enabled"] = True
+        try:
+            await query.edit_message_text(
+                f"♻️ تم إرجاع الاسم الافتراضي:\n*{DEFAULT_CHANNEL_LABEL}*",
+                parse_mode="Markdown",
+            )
+        except TelegramError:
+            pass
+        return
+
+
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, ctx.bot_data):
         return
@@ -1044,6 +1185,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.bot_data.get("pending_images", {}).pop(chat_id, None)
     ctx.bot_data.setdefault("cancel_flags", {})[chat_id] = True
     ctx.user_data["sending"] = False
+    ctx.user_data.pop("awaiting_label", None)
     cleanup_lock(chat_id)
 
     await update.message.reply_text(
@@ -1249,11 +1391,13 @@ async def cmd_delay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, ctx.bot_data):
         return
+    chat_id = update.effective_chat.id
+    label = get_active_label(ctx.bot_data, chat_id) or DEFAULT_CHANNEL_LABEL
     try:
         await ctx.bot.send_poll(
-            chat_id           = update.effective_chat.id,
+            chat_id           = chat_id,
             question          = "🧪 سؤال اختبار — البوت يعمل بشكل صحيح!",
-            options           = ["✅ الإجابة الصحيحة", "❌ خاطئة", "❌ خاطئة", CHANNEL_LABEL],
+            options           = ["✅ الإجابة الصحيحة", "❌ خاطئة", "❌ خاطئة", label],
             type              = "quiz",
             correct_option_id = 0,
             is_anonymous      = True,
@@ -1337,6 +1481,22 @@ async def cmd_clearsaved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, ctx.bot_data):
         return
+
+    # في انتظار اسم قناة جديد (بعد الضغط على "✏️ إرسال اسم جديد")
+    if ctx.user_data.pop("awaiting_label", False):
+        chat_id = update.effective_chat.id
+        text = (update.message.text or "").strip()
+        if not text:
+            await update.message.reply_text("⚠️ لا يمكن أن يكون الاسم فارغاً. حاول مجدداً عبر /label")
+            return
+        saved = set_label_text(ctx.bot_data, chat_id, text)
+        await update.message.reply_text(
+            f"✅ تم تعيين اسم القناة الجديد:\n*{saved}*\n\n"
+            "سيظهر الآن كخيار إضافي تلقائياً في كل سؤال.",
+            parse_mode="Markdown",
+        )
+        return
+
     if await handle_text_after_image(update, ctx):
         return
 
@@ -1663,6 +1823,8 @@ def main():
         ("resume",     cmd_resume),
         ("myid",       cmd_myid),
         ("addadmin",   cmd_addadmin),
+        ("label",      cmd_label),
+        ("setlabel",   cmd_setlabel),
         ("send",       cmd_send),
         ("clear",      cmd_clear),
         ("preview",    cmd_preview),
@@ -1684,6 +1846,7 @@ def main():
     # ── أزرار ──────────────────────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(handle_destination,       pattern=r"^dest:"))
     app.add_handler(CallbackQueryHandler(handle_saved_destination, pattern=r"^saved_dest:"))
+    app.add_handler(CallbackQueryHandler(handle_label_button,      pattern=r"^label:"))
 
     # ── Error Handler ──────────────────────────────────────────────────────
     app.add_error_handler(error_handler)
