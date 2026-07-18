@@ -1026,6 +1026,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/clear — مسح الأسئلة الحالية\n"
         "/delay [ث] — ضبط التأخير (0.3–10)\n"
         "/addadmin [ID] — إضافة أدمن مؤقت\n"
+        "/removeadmin [ID] — إزالة أدمن مُضاف سابقاً\n"
+        "/admins — عرض قائمة كل الأدمن الحاليين\n"
         "/label — إدارة اسم القناة (عرض/تغيير/تعطيل)\n"
         "/setlabel [اسم] — تغيير اسم القناة مباشرة\n"
         "/test — سؤال اختبار\n"
@@ -1064,9 +1066,65 @@ async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     admins.add(new_id)
     await update.message.reply_text(
         f"✅ تمت إضافة `{new_id}` كأدمن.\n"
+        f"إجمالي الأدمن الآن: {len(get_all_admins(ctx.bot_data))}\n\n"
+        "لإزالته لاحقاً: `/removeadmin " + str(new_id) + "`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_removeadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """يزيل أدمناً سبقت إضافته عبر /addadmin (لا يؤثر على الأدمن الأساسيين)."""
+    if not is_admin(update.effective_user.id, ctx.bot_data):
+        return
+    args = ctx.args
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "الاستخدام: `/removeadmin 123456789`\n\n"
+            "لعرض كل الأدمن الحاليين استخدم /admins",
+            parse_mode="Markdown",
+        )
+        return
+
+    target_id = int(args[0])
+    admins    = ctx.bot_data.setdefault("dynamic_admins", set())
+
+    if target_id in _BASE_ADMIN_IDS:
+        await update.message.reply_text(
+            "⛔ هذا آيدي أدمن أساسي (مضبوط من إعدادات البوت/البيئة) "
+            "ولا يمكن إزالته من داخل البوت."
+        )
+        return
+
+    if target_id not in admins:
+        await update.message.reply_text(
+            f"⚠️ الآيدي `{target_id}` ليس ضمن الأدمن المُضافين ديناميكياً.\n"
+            "استخدم /admins لعرض القائمة الحالية.",
+            parse_mode="Markdown",
+        )
+        return
+
+    admins.discard(target_id)
+    await update.message.reply_text(
+        f"✅ تمت إزالة `{target_id}` من الأدمن.\n"
         f"إجمالي الأدمن الآن: {len(get_all_admins(ctx.bot_data))}",
         parse_mode="Markdown",
     )
+
+
+async def cmd_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """يعرض قائمة كل الأدمن الحاليين: الأساسيون (ثابتون) والمُضافون ديناميكياً (قابلون للإزالة)."""
+    if not is_admin(update.effective_user.id, ctx.bot_data):
+        return
+    dynamic = ctx.bot_data.get("dynamic_admins", set())
+
+    lines = ["👥 *قائمة الأدمن الحاليين:*\n", "🔒 *أساسيون (لا يمكن إزالتهم من هنا):*"]
+    lines += [f"• `{uid}`" for uid in sorted(_BASE_ADMIN_IDS)] or ["—"]
+
+    lines.append("\n➕ *مُضافون ديناميكياً (قابلون للإزالة):*")
+    lines += [f"• `{uid}`" for uid in sorted(dynamic)] if dynamic else ["لا يوجد"]
+
+    lines.append("\nللإضافة: `/addadmin ID`\nللإزالة: `/removeadmin ID`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 def label_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
@@ -1823,6 +1881,8 @@ def main():
         ("resume",     cmd_resume),
         ("myid",       cmd_myid),
         ("addadmin",   cmd_addadmin),
+        ("removeadmin",cmd_removeadmin),
+        ("admins",     cmd_admins),
         ("label",      cmd_label),
         ("setlabel",   cmd_setlabel),
         ("send",       cmd_send),
