@@ -396,8 +396,18 @@ def _match_option(line: str) -> tuple[bool, str]:
 
 
 def _parse_inline(line: str) -> list[str]:
+    """
+    يكتشف صيغة 'كل الخيارات على سطر واحد' (مثل: A. نص B. نص C. نص).
+    نرفض أي نتيجة تحتوي على نص فارغ لأحد الخيارات — فهذا يعني عملياً أن
+    المطابقة وقعت على حرف كبير + نقطة داخل نص خيار واحد فعلي (مثل
+    'Vitamin A.' أو 'Hepatitis B.' أو 'Down syndrome A.')، وليس فاصلاً بين
+    خيارين حقيقيين، لأنه لا يوجد كلام بعده حتى نهاية السطر.
+    """
     m = _INLINE_OPT.findall(line)
-    return [clean_option(t) for _, t in m] if len(m) >= 2 else []
+    texts = [clean_option(t) for _, t in m]
+    if len(texts) >= 2 and all(texts):
+        return texts
+    return []
 
 
 def extract_questions(raw_text: str) -> list[Question]:
@@ -515,7 +525,12 @@ def extract_questions(raw_text: str) -> list[Question]:
         # خيار (لاتيني أو عربي)
         is_opt, opt_text = _match_option(line)
         if is_opt:
-            inline = _parse_inline(line)
+            # نحاول كشف "عدة خيارات على سطر واحد" فقط عندما لا توجد خيارات
+            # متراكمة بعد لهذا السؤال (أول سطر خيار). هذا يمنع اعتبار كلمات
+            # مثل "Hepatitis A." أو "Vitamin B." أو "Down syndrome A." —
+            # حيث ينتهي نص الخيار بحرف كبير متبوع بنقطة — كخيار جديد خطأً،
+            # وهو خطأ كان يحذف أسئلة كاملة بصمت عند اختلال عدّ الخيارات.
+            inline = _parse_inline(line) if not cur_opts else []
             if inline:
                 cur_opts = inline
                 opt_idx  = len(cur_opts) - 1
@@ -541,14 +556,10 @@ def extract_questions(raw_text: str) -> list[Question]:
                 cur_ans  = tf_correct
             continue
 
-        # استمرار الخيار
+        # استمرار الخيار (سطر تكميلي لنفس الخيار الحالي — لا نعيد تحليله
+        # كخيارات متعددة أبداً، تجنباً لنفس مشكلة الكشف الخاطئ أعلاه)
         if opt_idx >= 0 and cur_ans is None:
-            inline = _parse_inline(line)
-            if inline:
-                cur_opts = inline
-                opt_idx  = len(cur_opts) - 1
-            else:
-                cur_opts[opt_idx] += " " + line
+            cur_opts[opt_idx] += " " + line
             continue
 
         # استمرار السؤال
@@ -590,9 +601,12 @@ def extract_options_and_answer(text: str) -> tuple[list[str] | None, int | None]
 
         is_opt, opt_text = _match_option(line)
         if is_opt:
-            inline = _INLINE_OPT.findall(line)
-            if len(inline) >= 2:
-                opts    = [clean_option(t) for _, t in inline]
+            # نفس إصلاح extract_questions: لا نحاول كشف "خيارات متعددة على سطر
+            # واحد" إلا في أول سطر خيار، ونستخدم _parse_inline المُحصَّن ضد
+            # كلمات مثل "Hepatitis A." أو "Vitamin B."
+            inline = _parse_inline(line) if not opts else []
+            if inline:
+                opts    = inline
                 opt_idx = len(opts) - 1
             else:
                 opts.append(clean_option(opt_text))
