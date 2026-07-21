@@ -150,7 +150,6 @@ def pdf_to_images(data: bytes, scale: float = 3.5) -> list[tuple[str, str]]:
         mat = fitz.Matrix(scale, scale)
         for page in doc:
             pix = page.get_pixmap(matrix=mat)
-            # إذا كانت الصورة كبيرة جداً نضغطها
             img_bytes = pix.tobytes("jpeg", jpg_quality=88)
             img_b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
             images.append((img_b64, "image/jpeg"))
@@ -163,36 +162,78 @@ def pdf_to_images(data: bytes, scale: float = 3.5) -> list[tuple[str, str]]:
 
 
 def renumber_and_deduplicate(text: str) -> str:
-    """يعيد ترقيم الأسئلة ويحذف المكررات."""
-    # استخراج كل الأسئلة
-    pattern = re.compile(
-        r'Q\d+\.\s*(.*?)\n((?:[A-D]\..+\n?)+)Answer:\s*([A-D])',
-        re.DOTALL
-    )
-    matches = pattern.findall(text)
+    """
+    يعيد ترقيم الأسئلة ويحذف المكررات.
 
-    if not matches:
+    ملاحظة إصلاح: النسخة القديمة استخدمت regex واحد شامل (بصيغة DOTALL)
+    كان يفترض 4 خيارات فقط (A-D) دائماً. مع أي سؤال بعدد خيارات مختلف
+    (5 خيارات A-E مثلاً، شائعة جداً في بنوك أسئلة كثيرة)، كان الـ regex
+    يفشل بصمت أو "يبتلع" نصاً ضخماً بالخطأ بسبب الجشع (greedy) مع DOTALL،
+    مما يُسقط أو يُشوّه أسئلة عشوائية حسب شكل النص. الحل: تحليل سطراً
+    بسطر بدل regex واحد هش، يدعم أي عدد خيارات وأي حرف إجابة.
+    """
+    # نقسم النص إلى كتل، كل كتلة تبدأ بسطر "Qرقم."
+    blocks = re.split(r'(?=^Q\d+\.\s)', text, flags=re.MULTILINE)
+
+    _OPT_RE = re.compile(r'^([A-Za-z])\.\s*(.+)$')
+    _ANS_RE = re.compile(r'^Answer:\s*([A-Za-z])\s*$', re.IGNORECASE)
+
+    parsed: list[tuple[str, list[str], str]] = []
+    for block in blocks:
+        block = block.strip()
+        if not block or not re.match(r'^Q\d+\.', block):
+            continue
+
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        question_lines = [re.sub(r'^Q\d+\.\s*', '', lines[0])]
+        options: list[str] = []
+        answer: str | None = None
+
+        for line in lines[1:]:
+            m_ans = _ANS_RE.match(line)
+            if m_ans:
+                answer = m_ans.group(1).upper()
+                continue
+            m_opt = _OPT_RE.match(line)
+            if m_opt:
+                options.append(line)
+                continue
+            if not options:
+                # سطر إضافي لنص سؤال متعدد الأسطر (قبل بدء الخيارات)
+                question_lines.append(line)
+
+        if answer and len(options) >= 2:
+            parsed.append((" ".join(question_lines).strip(), options, answer))
+
+    if not parsed:
         return text
 
     seen = set()
     unique = []
-    for question, options, answer in matches:
-        # مفتاح التكرار: أول 60 حرف من السؤال
-        key = question.strip()[:60].lower()
+    for question, options, answer in parsed:
+        # مفتاح التكرار: النص الكامل بعد تطبيع المسافات (وليس أول 60 حرف
+        # فقط) — لأن أسئلة كثيرة تتشارك نفس الصياغة الأولى بالضبط
+        # (مثال: "Which of the following is a characteristic feature of
+        # eukaryotic transcription?" و"...eukaryotic translation
+        # initiation?") فتُعتبر خطأً سؤالاً واحداً مكرراً وتُحذف إحداهما
+        # بصمت رغم أنهما سؤالان مختلفان تماماً.
+        key = re.sub(r'\s+', ' ', question.strip().lower())
         if key not in seen:
             seen.add(key)
-            unique.append((question.strip(), options.strip(), answer.strip()))
+            unique.append((question.strip(), options, answer.strip()))
 
-    # إعادة البناء مع ترقيم جديد
-    lines = []
+    lines_out = []
     for i, (q, opts, ans) in enumerate(unique, 1):
-        lines.append(f"Q{i}. {q}")
-        lines.append(opts)
-        lines.append(f"Answer: {ans}")
-        lines.append("")
+        lines_out.append(f"Q{i}. {q}")
+        lines_out.extend(opts)
+        lines_out.append(f"Answer: {ans}")
+        lines_out.append("")
 
-    logger.info("Deduplicated: %d → %d questions", len(matches), len(unique))
-    return "\n".join(lines)
+    logger.info("Deduplicated: %d → %d questions", len(parsed), len(unique))
+    return "\n".join(lines_out)
 
 
 async def process_pages_parallel(images: list[tuple[str, str]]) -> str:
@@ -200,14 +241,12 @@ async def process_pages_parallel(images: list[tuple[str, str]]) -> str:
     total = len(images)
     logger.info("Processing %d pages in parallel", total)
 
-    # إنشاء المهام كلها دفعة واحدة
     tasks = [
         ask_gemini_single_image(img_b64, media_type, i + 1, total)
         for i, (img_b64, media_type) in enumerate(images)
     ]
 
-    # تشغيل متوازي مع semaphore لتجنب تجاوز حدود API
-    semaphore = asyncio.Semaphore(3)  # 3 طلبات في نفس الوقت كحد أقصى
+    semaphore = asyncio.Semaphore(3)
 
     async def bounded_task(task):
         async with semaphore:
@@ -218,7 +257,6 @@ async def process_pages_parallel(images: list[tuple[str, str]]) -> str:
         return_exceptions=True
     )
 
-    # جمع النتائج الناجحة
     combined = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
@@ -246,27 +284,21 @@ async def smart_extract_mcq(filename: str, data: bytes) -> str:
         "webp": "image/webp",
     }
 
-    # صورة واحدة
     if ext in image_types:
         img_b64 = base64.standard_b64encode(data).decode("utf-8")
         logger.info("Single image — sending to Gemini Vision")
         return await ask_gemini_with_image(img_b64, image_types[ext])
 
-    # PDF
     if ext == "pdf":
-        # تحويل لصور بدقة 3.5x
         images = pdf_to_images(data, scale=3.5)
 
         if images:
             logger.info("Processing %d pages in parallel", len(images))
             raw_result = await process_pages_parallel(images)
-
-            # إزالة التكرار وإعادة الترقيم
             final = renumber_and_deduplicate(raw_result)
             logger.info("Final result: %d chars", len(final))
             return final
 
-        # احتياطي: إرسال PDF مباشرة
         logger.info("Fallback: sending PDF directly")
         pdf_b64 = base64.standard_b64encode(data).decode("utf-8")
         contents = [{
@@ -278,7 +310,6 @@ async def smart_extract_mcq(filename: str, data: bytes) -> str:
         }]
         return await ask_gemini(contents)
 
-    # نص عادي
     for enc in ("utf-8", "utf-8-sig", "cp1256", "latin-1"):
         try:
             text = data.decode(enc)
