@@ -167,6 +167,7 @@ class Question:
     correct:     int
     image:       str | None = None
     explanation: str | None = None
+    source_num:  int | None = None  # رقم السؤال كما ورد في النص الأصلي (لأغراض التشخيص فقط)
 
     def is_valid(self) -> bool:
         return (
@@ -467,6 +468,7 @@ def extract_questions(raw_text: str) -> list[Question]:
                     correct=     correct,
                     image=       cur_img,
                     explanation= cur_expl,
+                    source_num=  cur_num,
                 ))
 
         if cur_ans == "ALL":
@@ -579,6 +581,38 @@ def extract_questions(raw_text: str) -> list[Question]:
     flush()
     logger.info("✅ استُخرج %d سؤال", len(questions))
     return questions
+
+
+def scan_expected_question_numbers(raw_text: str) -> list[int]:
+    """
+    يفحص النص الخام ويُعيد كل أرقام الأسئلة الظاهرة في بداية الأسطر
+    (مثل '31.' أو '31)' في بداية السطر)، بصرف النظر عن نجاح تحليلها
+    لاحقاً كسؤال كامل أم لا.
+
+    يُستخدم هذا فقط لتشخيص الفرق بين "كم سؤالاً وُجد رقمه في النص"
+    و"كم سؤالاً استُخرج فعلياً" — حتى نستطيع إخبار المستخدم بالأرقام
+    المفقودة تحديداً بدل عرض فرق غامض في العدد الإجمالي فقط.
+    """
+    text  = normalize_text(raw_text)
+    lines = text.splitlines()
+    nums: list[int] = []
+    in_key = False
+    for raw in lines:
+        s = raw.strip()
+        if _KEY_HDR.match(s):
+            in_key = True
+            continue
+        if in_key:
+            if _KEY_LINE.match(s):
+                continue
+            if s and not _DIVIDER.match(s):
+                in_key = False
+            else:
+                continue
+        m_q = _Q_PAT.match(s)
+        if m_q and not _ANS_KEYWORD.match(s):
+            nums.append(int(m_q.group(1)))
+    return nums
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1596,13 +1630,29 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def _merge_chunks(chunks: list[str]) -> str:
-    if not chunks:
-        return ""
-    merged = chunks[0]
-    for i in range(1, len(chunks)):
-        prev_full = len(chunks[i - 1]) >= TG_MSG_LIMIT - 100
-        merged   += chunks[i] if prev_full else "\n" + chunks[i]
-    return merged
+    """
+    يدمج عدة رسائل نصية متتالية (وصلت لأن تيليجرام يمنع إرسال رسالة
+    واحدة أطول من 4096 حرف، فيُضطر المستخدم لتقسيم النص الطويل على
+    عدة رسائل) إلى نص واحد متماسك.
+
+    ملاحظة إصلاح: كانت النسخة القديمة تحاول "تخمين" هل الرسالة السابقة
+    انقطعت في منتصف سطر (فتُلصق الرسالتين بدون أي فاصل) أو انتهت نهاية
+    طبيعية (فتُضيف سطراً جديداً)، بالاعتماد فقط على طول الرسالة. هذا
+    التخمين كان يفشل كثيراً ويُنتج التصاق آخر سطر من رسالة مع أول سطر من
+    الرسالة التالية بلا أي فاصل — فيتحول مثلاً:
+        "...Answer: A"  +  "32. It is correct to say:..."
+    إلى سطر واحد ملتصق: "...Answer: A32. It is correct to say:..."
+    وبما أن المحلّل (extract_questions) يعتمد على أن كل سؤال جديد يبدأ في
+    "بداية سطر" برقم، فإن هذا الالتصاق كان يُفقد رقم السؤال الجديد تماماً
+    فتندمج خيارات سؤالين في سؤال واحد ويقل العدد الإجمالي المُستخرج.
+
+    الحل الجذري: نضع دائماً فاصل سطر (\n) بين كل رسالتين متتاليتين ولا
+    نخمّن شيئاً. هذا آمن دائماً لأن المحلّل أصلاً يتعامل مع الأسطر
+    المُتقطّعة (تكملة سؤال/خيار على عدة أسطر) بدمجها بمسافة، فإضافة سطر
+    جديد إضافي في مكان غير متوقع لا يكسر شيئاً، بينما حذف الفاصل عن طريق
+    الخطأ يُفسد استخراج السؤال بالكامل كما حدث فعلياً.
+    """
+    return "\n".join(chunks)
 
 
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1660,13 +1710,33 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await prog.delete()
     await _process(update, ctx, text)
 
+def _build_missing_numbers_note(text: str, questions: list) -> str:
+    """يبني سطر تحذير يوضح أرقام الأسئلة التي ظهرت في النص لكن لم تُستخرج، إن وُجدت."""
+    expected = scan_expected_question_numbers(text)
+    if len(expected) < 2:  # لا يوجد ترقيم واضح في النص أصلاً — لا تشخيص ممكن
+        return ""
+    found = {q.source_num for q in questions if getattr(q, "source_num", None) is not None}
+    missing = sorted(set(expected) - found)
+    if not missing:
+        return ""
+    shown = ", ".join(str(n) for n in missing[:20])
+    more  = f" (+{len(missing) - 20} غيرها)" if len(missing) > 20 else ""
+    return (
+        f"\n\n⚠️ *لم يتم استخراج الأسئلة التالية:* {shown}{more}\n"
+        "راجع صياغتها يدوياً (رقم السؤال في بداية السطر، 2-10 خيارات، "
+        "وسطر إجابة واضح)."
+    )
+
+
 async def _process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     questions = extract_questions(text)
+    missing_note = _build_missing_numbers_note(text, questions)
     if not questions:
         await update.message.reply_text(
             "⚠️ لم أجد أسئلة في النص.\n\n"
             "مثال على الصيغة الصحيحة:\n"
-            "```\n1. نص السؤال\nA. خيار 1\nB. خيار 2\nC. خيار 3\nAnswer: A\n```",
+            "```\n1. نص السؤال\nA. خيار 1\nB. خيار 2\nC. خيار 3\nAnswer: A\n```"
+            + missing_note,
             parse_mode="Markdown",
         )
         return
@@ -1689,7 +1759,8 @@ async def _process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
         ctx.user_data["questions"] = all_q
         await update.message.reply_text(
             f"✅ تمت إضافة *{len(questions)}* سؤال. الإجمالي: *{len(all_q)}*\n\n"
-            "استخدم /send للإرسال أو /preview للمعاينة.",
+            "استخدم /send للإرسال أو /preview للمعاينة."
+            + missing_note,
             parse_mode="Markdown",
         )
         return
@@ -1702,7 +1773,8 @@ async def _process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
         "send_target": None,
     })
     await update.message.reply_text(
-        f"✅ تم استخراج *{len(questions)}* سؤال\n\n📤 أين تريد الإرسال؟",
+        f"✅ تم استخراج *{len(questions)}* سؤال\n\n📤 أين تريد الإرسال؟"
+        + missing_note,
         reply_markup=dest_keyboard("dest"),
         parse_mode="Markdown",
     )
